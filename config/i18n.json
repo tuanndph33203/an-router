@@ -1,0 +1,25 @@
+{
+  "$schema": "./i18n-schema.json",
+  "default": "en",
+  "rtl": [],
+  "uiOnly": ["en", "vi"],
+  "docsExcluded": ["en", "vi"],
+  "locales": [
+    {
+      "code": "en",
+      "label": "EN",
+      "name": "English",
+      "native": "English",
+      "english": "English",
+      "flag": "🇺🇸"
+    },
+    {
+      "code": "vi",
+      "label": "VI",
+      "name": "Tiếng Việt",
+      "native": "Tiếng Việt",
+      "english": "Vietnamese",
+      "flag": "🇻🇳"
+    }
+  ]
+}
