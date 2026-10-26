@@ -48,9 +48,11 @@ async function fetchSchemaFromBackend(
   const cacheKey = `${schemaUrl}:${appId}:${mode}:${sortedTablesKey}`;
   const cached = schemaCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SCHEMA_CACHE_TTL_MS) {
+    console.log(`⚡ [SchemaBackend:CacheHit] mode="${mode}" | appId="${appId}" | tables=${sortedTablesKey}`);
     return cached.data;
   }
 
+  console.log(`🔌 [SchemaBackend:Fetch] Calling backend schema mode="${mode}" | appId="${appId}" | url="${schemaUrl}"`);
   if (!schemaUrl || !isSubscriptionFetchUrlAllowed(schemaUrl, { allowLocal: true })) {
     throw new Error(`URL schema không hợp lệ hoặc bị chặn: ${schemaUrl}`);
   }
@@ -178,6 +180,8 @@ export async function generateActionPlan(
   // Layer 1: Rule Luồng Cố Định (.md)
   const coreFlowRules = (appConfig.domainPlaybook || "").trim();
   const knowledgeAppKey = appConfig.appId || appConfig.microsoftClientKey;
+
+  console.log(`\n🚀 [Orchestrator:PlanEngine] START generateActionPlan | instruction: "${instruction}" | appId: "${targetAppId}" | supportsSql: ${supportsSql}`);
 
   // Danh sách công cụ (Tools) cung cấp cho AI
   const tools: any[] = [];
@@ -349,9 +353,9 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
    - Gọi công cụ \`search_knowledge\` với từ khóa phù hợp để lấy kiến thức từ DB (Multi-Search + Reranker).
    - Sau khi nhận được kết quả tri thức ở lượt tiếp theo, hãy tổng hợp câu trả lời đầy đủ, chính xác và gọi \`submit_plan\` với \`action: "direct_answer"\`.
 3. NẾU NGƯỜI DÙNG YÊU CẦU BÁO CÁO HOẶC TRA CỨU SỐ LIỆU CSDL:
-   - Bước 1: Gọi \`list_tables\` để xem danh sách bảng có trong hệ thống.
-   - Bước 2: Gọi \`describe_tables\` để nạp cấu trúc chi tiết các cột cần truy vấn (tối đa 6 bảng liên quan).
-   - Bước 3: Sau khi đã nắm rõ cấu trúc bảng và kiểu dữ liệu, gọi \`submit_plan\` với:
+   - Bước 1: Gọi \`list_tables\` để xem danh sách bảng có trong hệ thống (chỉ gọi 1 lần duy nhất).
+   - Bước 2: Từ danh sách bảng vừa nhận được ở Bước 1, BẮT BUỘC chọn ngay 1 đến 5 bảng phù hợp và gọi \`describe_tables\` để xem chi tiết các cột. TUYỆT ĐỐI KHÔNG gọi lại \`list_tables\`.
+   - Bước 3: Sau khi đã có cấu trúc cột từ \`describe_tables\`, BẮT BUỘC gọi \`submit_plan\` ngay để trả câu truy vấn SQL với:
      * \`action\`: "report_sql"
      * \`endpoint\`: "${sqlEndpoint}"
      * \`resolvedPayload\`:
@@ -377,6 +381,7 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
 
   while (turn < maxTurns) {
     turn++;
+    console.log(`\n📍 [Orchestrator:PlanEngine] --- TURN ${turn}/${maxTurns} ---`);
 
     const isLastTurn = turn === maxTurns;
     const toolChoice = isLastTurn
@@ -386,6 +391,11 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
     const response = await callInternalLlmWithTools(messages, tools, toolChoice);
 
     if (response.toolCalls && response.toolCalls.length > 0) {
+      console.log(
+        `🤖 [Orchestrator:PlanEngine] LLM Turn ${turn} decided to call tool(s):`,
+        response.toolCalls.map((c) => `${c.function.name}(${c.function.arguments})`)
+      );
+
       messages.push({
         role: "assistant",
         content: response.content || null,
@@ -404,6 +414,9 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
         }
 
         if (fnName === "submit_plan") {
+          console.log(
+            `🎯 [Orchestrator:Tool:submit_plan] Terminal plan submitted: action="${args.action}", planName="${args.planName}", directAnswer=${Boolean(args.directAnswer)}`
+          );
           submittedPlan = {
             thought: args.thought || "Đã phân tích yêu cầu",
             planName: args.planName || "Kế hoạch xử lý",
@@ -422,11 +435,13 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
 
         let toolResultStr = "";
         if (fnName === "search_knowledge") {
+          console.log(`🔍 [Orchestrator:Tool:search_knowledge] Executing searchKnowledgeBase for query: "${args.query || instruction}" (topK=${args.topK || 3})`);
           onProgressStatus?.(`Đang tra cứu cơ sở tri thức: "${args.query || instruction}"...`);
           const searchRes = await searchKnowledgeBase(knowledgeAppKey, args.query || instruction, {
             topK: typeof args.topK === "number" ? args.topK : 3,
           });
           toolResultStr = searchRes.matchedContent || "Không tìm thấy đoạn kiến thức phù hợp trong DB.";
+          console.log(`🔍 [Orchestrator:Tool:search_knowledge] Retrieved ${searchRes.topChunks?.length || 0} chunk(s) from knowledge base`);
           executionSteps.push({
             stepIndex: executionSteps.length,
             name: `Tra cứu tri thức: ${args.query || instruction}`,
@@ -434,6 +449,7 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
             status: "success",
           });
         } else if (fnName === "list_tables") {
+          console.log(`📋 [Orchestrator:Tool:list_tables] Executing list_tables (keyword: "${args.keyword || '*'}")`);
           onProgressStatus?.("Đang kiểm tra danh mục bảng CSDL...");
           try {
             const summaryData = await fetchSchemaFromBackend(
@@ -448,7 +464,12 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
             const filteredTables = keyword
               ? allTables.filter((t) => t.toLowerCase().includes(keyword))
               : allTables;
-            toolResultStr = JSON.stringify({ totalTables: allTables.length, tables: filteredTables.slice(0, 50) });
+            console.log(`📋 [Orchestrator:Tool:list_tables] Found ${filteredTables.length} table(s) matching keyword`);
+            toolResultStr = JSON.stringify({
+              totalTables: allTables.length,
+              tables: filteredTables.slice(0, 50),
+              nextStep: "Đã có danh mục bảng. Bước tiếp theo BẮT BUỘC bạn phải gọi describe_tables với mảng các bảng liên quan nhất (ví dụ ['SaleBill', 'Branchs'] hoặc tương tự), tuyệt đối không gọi lại list_tables.",
+            });
             executionSteps.push({
               stepIndex: executionSteps.length,
               name: "Liệt kê danh mục bảng CSDL",
@@ -460,6 +481,7 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
           }
         } else if (fnName === "describe_tables") {
           const reqTables: string[] = Array.isArray(args.tables) ? args.tables.slice(0, 6) : [];
+          console.log(`📊 [Orchestrator:Tool:describe_tables] Executing describe_tables for tables:`, reqTables);
           onProgressStatus?.(`Đang xem cấu trúc bảng: ${reqTables.join(", ")}...`);
           try {
             const detailData = await fetchSchemaFromBackend(
@@ -469,7 +491,11 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
               reqTables,
               userAuthToken
             );
-            toolResultStr = JSON.stringify(detailData || {});
+            console.log(`📊 [Orchestrator:Tool:describe_tables] Received schema details for ${reqTables.length} table(s)`);
+            toolResultStr = JSON.stringify({
+              schema: detailData || {},
+              nextStep: "Đã có cấu trúc chi tiết các cột của bảng. BẮT BUỘC gọi ngay submit_plan với action='report_sql' để sinh câu lệnh SQL an toàn.",
+            });
             executionSteps.push({
               stepIndex: executionSteps.length,
               name: `Xem cấu trúc bảng: ${reqTables.join(", ")}`,

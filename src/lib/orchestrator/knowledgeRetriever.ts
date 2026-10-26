@@ -497,6 +497,8 @@ export async function ingestDocumentsToKnowledgeDb(
     throw new Error("Thiếu mã ứng dụng (appId) khi lưu vào DB Kiến thức.");
   }
 
+  console.log(`📥 [KnowledgeRetriever:Ingest] Starting ingestion of ${documents.length} doc(s) for appId="${normalizedAppId}"`);
+
   const db = getDbInstance();
   const now = new Date().toISOString();
   let documentsSaved = 0;
@@ -997,8 +999,11 @@ export async function searchKnowledgeBase(
     return { topChunks: [], matchedContent: "", isGreeting: false };
   }
 
+  console.log(`\n📚 [KnowledgeRetriever:searchKnowledgeBase] START | appId: "${normalizedAppId}" | query: "${query}" | totalLoadedChunks: ${allChunks.length} | topK: ${topK}`);
+
   // Nếu kho kiến thức chỉ có <= topK mục, trả về trực tiếp
   if (allChunks.length <= topK) {
+    console.log(`📚 [KnowledgeRetriever:searchKnowledgeBase] Total chunks (${allChunks.length}) <= topK (${topK}), returning directly.`);
     return {
       topChunks: allChunks,
       matchedContent: allChunks.map((c) => c.content).join("\n\n"),
@@ -1018,6 +1023,10 @@ export async function searchKnowledgeBase(
     const vecDb = getBetterDbWithVec();
     const queryVec = generateSemanticVector(query);
     const ftsTerm = sanitizeQueryForFts5(query);
+
+    console.log(`   🔹 [sqlite-vec] Generated 128-dim dense embedding`);
+    console.log(`   🔹 [FTS5] Sanitized sparse query term: "${ftsTerm}"`);
+    console.log(`   ⚡ [Hybrid RRF] Executing Alex Garcia native SQL fusion on SQLite...`);
 
     const ftsClause = ftsTerm
       ? "fts.app_id = ? AND fts_knowledge_chunks MATCH ?"
@@ -1074,6 +1083,7 @@ export async function searchKnowledgeBase(
 
     const rows = vecDb.prepare(hybridSql).all(...params) as any[];
     if (rows && rows.length > 0) {
+      console.log(`   ⚡ [Hybrid RRF] Native query returned ${rows.length} fused candidates (Top RRF score: ${rows[0]?.rrf_score})`);
       candidateChunks = rows.map((r: any) => ({
         id: r.id,
         index: 0,
@@ -1151,6 +1161,7 @@ export async function searchKnowledgeBase(
   // Chấm điểm lại chính xác để chọn ra Top-K mục tinh hoa nhất
   // -------------------------------------------------------------
   try {
+    console.log(`   ⚖️ [CrossEncoderRanker] Evaluating relevance for ${candidateChunks.length} candidate(s)...`);
     const candidateCatalog = candidateChunks
       .map((c, i) => `[${i}] ${c.heading} - ${c.preview || c.content.slice(0, 120)}`)
       .join("\n");
@@ -1177,6 +1188,7 @@ Chỉ trả về DUY NHẤT một chuỗi JSON:
     const jsonStr = extractFirstJsonObject(rerankRaw);
     if (jsonStr) {
       const parsed = JSON.parse(jsonStr);
+      console.log(`   ✅ [CrossEncoderRanker] Completed: isGreeting=${parsed?.isGreeting}, selectedIndices=${JSON.stringify(parsed?.selectedIndices)}`);
       if (parsed?.isGreeting === true) {
         return {
           topChunks: [],
