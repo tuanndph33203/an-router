@@ -752,6 +752,7 @@ export default function RulesUnifiedPage() {
           </div>
         }
         size="full"
+        className="max-w-5xl"
         footer={
           <div className="flex items-center justify-between w-full">
             <div>
@@ -803,70 +804,86 @@ export default function RulesUnifiedPage() {
               size="sm"
             />
 
-            {/* Toolbar thao tác nhanh khi ở Tab Tri Thức và đã có tài liệu */}
-            {activeTab === "knowledge_db" && knowledgeDocs.length > 0 && (
-              <div className="flex items-center gap-1.5">
-                <Button
-                  variant={showSearchSandbox ? "primary" : "secondary"}
-                  size="sm"
-                  icon="search"
-                  onClick={() => setShowSearchSandbox(!showSearchSandbox)}
-                >
-                  Tìm thử
-                </Button>
-
-                <Button
-                  variant="primary"
-                  size="sm"
-                  icon="upload_file"
-                  onClick={() => {
-                    setTargetAppForNewDoc(selectedAppId);
-                    fileInputRef.current?.click();
-                  }}
-                  disabled={isUploadingToDb}
-                >
-                  Chọn File
-                </Button>
-
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  icon="folder_open"
-                  onClick={() => {
-                    setTargetAppForNewDoc(selectedAppId);
-                    folderInputRef.current?.click();
-                  }}
-                  disabled={isUploadingToDb}
-                >
-                  Chọn Folder
-                </Button>
-
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  icon="edit_note"
-                  onClick={() => {
-                    setTargetAppForNewDoc(selectedAppId);
-                    setShowAddRuleModal(true);
-                  }}
-                >
-                  Nhập tay
-                </Button>
-
-                <Button
-                  variant="danger"
-                  size="sm"
-                  icon="delete_sweep"
-                  onClick={handleClearAllKnowledge}
-                  title="Xóa toàn bộ tài liệu"
-                />
-              </div>
-            )}
+            {/* Quick status on the right */}
+            <div className="text-xs text-text-muted flex items-center gap-2">
+              <span>Ứng dụng:</span>
+              <span className="font-mono font-bold uppercase text-text-main">{selectedAppId}</span>
+            </div>
           </div>
 
           {/* TAB 1: KHO TRI THỨC NGHIỆP VỤ */}
           {activeTab === "knowledge_db" && (
-            <div className="space-y-3">
+            <div className="space-y-4">
+              {/* Toolbar thao tác khi đã có tài liệu trong DB */}
+              {knowledgeDocs.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2.5 p-3 rounded-xl bg-surface/60 border border-border">
+                  <div className="flex items-center gap-2 text-xs text-text-muted">
+                    <span className="material-symbols-outlined text-base text-primary">folder</span>
+                    <span>
+                      Đang quản lý <strong>{knowledgeDocs.length}</strong> tài liệu (
+                      <strong>{totalKnowledgeChunks}</strong> mục tri thức vector)
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant={showSearchSandbox ? "primary" : "secondary"}
+                      size="sm"
+                      icon="search"
+                      onClick={() => setShowSearchSandbox(!showSearchSandbox)}
+                    >
+                      Tìm thử
+                    </Button>
+
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      icon="upload_file"
+                      onClick={() => {
+                        setTargetAppForNewDoc(selectedAppId);
+                        fileInputRef.current?.click();
+                      }}
+                      disabled={isUploadingToDb}
+                    >
+                      Chọn File
+                    </Button>
+
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      icon="folder_open"
+                      onClick={() => {
+                        setTargetAppForNewDoc(selectedAppId);
+                        folderInputRef.current?.click();
+                      }}
+                      disabled={isUploadingToDb}
+                    >
+                      Chọn Folder
+                    </Button>
+
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      icon="edit_note"
+                      onClick={() => {
+                        setTargetAppForNewDoc(selectedAppId);
+                        setShowAddRuleModal(true);
+                      }}
+                    >
+                      Nhập tay
+                    </Button>
+
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      icon="delete_sweep"
+                      onClick={handleClearAllKnowledge}
+                      title="Xóa toàn bộ tài liệu"
+                    />
+                  </div>
+                </div>
+              )}
+
               {/* Thông báo kết quả nạp */}
               {knowledgeUploadMsg && (
                 <div className="px-3.5 py-2.5 rounded-xl bg-green-500/10 border border-green-500/30 text-green-700 dark:text-green-300 text-xs flex items-center justify-between">
@@ -1073,7 +1090,7 @@ export default function RulesUnifiedPage() {
                     }}
                     onDragLeave={() => setIsDraggingOver(false)}
                     onDrop={handleDropFiles}
-                    className={`px-4 py-2 rounded-xl border border-dashed transition-all flex items-center justify-center gap-2 text-center text-xs ${
+                    className={`px-4 py-2.5 rounded-xl border border-dashed transition-all flex items-center justify-center gap-2 text-center text-xs ${
                       isDraggingOver
                         ? "border-primary bg-primary/5 text-primary"
                         : "border-border/80 bg-surface/30 text-text-muted hover:border-primary/40 hover:text-text-main"
@@ -1111,8 +1128,8 @@ export default function RulesUnifiedPage() {
                     </div>
                   )}
 
-                  {/* Danh sách Thẻ tài liệu lưới 3 cột */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 max-h-[360px] overflow-y-auto pr-1">
+                  {/* Danh sách Thẻ tài liệu lưới 3 cột - Không giới hạn max-h cứng để tránh scroll lồng nhau */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
                     {knowledgeDocs.map((doc) => {
                       const lower = doc.relativePath.toLowerCase();
                       const isPdf = lower.endsWith(".pdf");
@@ -1208,7 +1225,7 @@ export default function RulesUnifiedPage() {
                   placeholder={
                     "# QUY TẮC BẮT BUỘC:\n1. Luôn thêm điều kiện IsDeleted = 0 vào mệnh đề WHERE.\n2. Định dạng số tiền là VNĐ kèm phân cách hàng nghìn.\n3. Nếu người dùng không chỉ định chi nhánh, mặc định lấy chi nhánh hiện tại."
                   }
-                  rows={12}
+                  rows={14}
                   className="font-mono text-xs leading-relaxed"
                 />
               </div>
@@ -1295,13 +1312,10 @@ export default function RulesUnifiedPage() {
       {/* MODAL XEM CHI TIẾT CÁC CHUNK KIẾN THỨC CỦA 1 TÀI LIỆU */}
       <Modal
         isOpen={Boolean(inspectingDoc)}
-        title={
-          inspectingDoc
-            ? `Chi tiết tri thức (Chunks) — ${inspectingDoc.docName}`
-            : "Chi tiết Chunks"
-        }
+        title={inspectingDoc ? `Chi tiết tri thức: ${inspectingDoc.docName}` : "Chi tiết Chunks"}
         onClose={() => setInspectingDoc(null)}
-        size="xl"
+        size="full"
+        className="max-w-4xl"
         footer={
           <div className="flex justify-end w-full">
             <Button variant="outline" size="sm" onClick={() => setInspectingDoc(null)}>
@@ -1310,16 +1324,16 @@ export default function RulesUnifiedPage() {
           </div>
         }
       >
-        <div className="flex flex-col gap-3.5 max-h-[70vh]">
+        <div className="flex flex-col gap-3.5">
           {inspectingDoc && (
             <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-surface border border-border text-xs">
-              <div>
+              <div className="min-w-0 flex-1">
                 <span className="text-text-muted">Đường dẫn: </span>
-                <code className="font-mono font-bold text-text-main">
+                <code className="font-mono font-bold text-text-main break-all">
                   {inspectingDoc.relativePath}
                 </code>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
                 <Badge variant="primary" size="sm">
                   {inspectingDoc.chunkCount} mục kiến thức
                 </Badge>
@@ -1342,11 +1356,11 @@ export default function RulesUnifiedPage() {
               Không tìm thấy chunk nào cho tài liệu này.
             </div>
           ) : (
-            <div className="flex flex-col gap-2.5 overflow-y-auto pr-1">
+            <div className="flex flex-col gap-3">
               {inspectingDocChunks.map((chunk, idx) => (
                 <div
                   key={chunk.id || idx}
-                  className="p-3.5 rounded-xl border border-border bg-surface/70 space-y-2 hover:border-primary/40 transition-colors"
+                  className="p-4 rounded-xl border border-border bg-surface/70 space-y-2 hover:border-primary/40 transition-colors shadow-2xs"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -1366,7 +1380,7 @@ export default function RulesUnifiedPage() {
                     </p>
                   )}
 
-                  <pre className="text-[11px] font-mono p-3 rounded-lg bg-surface/90 border border-border text-text-main whitespace-pre-wrap leading-relaxed overflow-x-auto max-h-48">
+                  <pre className="text-xs font-mono p-3 rounded-lg bg-surface/90 border border-border text-text-main whitespace-pre-wrap break-words leading-relaxed">
                     {chunk.content}
                   </pre>
                 </div>
