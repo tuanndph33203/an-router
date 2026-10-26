@@ -1,6 +1,67 @@
 import { createHash, randomUUID } from "crypto";
+import path from "path";
+import os from "os";
 import { getDbInstance } from "@/lib/db/core";
 import { callInternalLlm } from "./planEngine";
+
+
+let betterDbWithVecInstance: any = null;
+
+export function getBetterDbWithVec(): any {
+  if (betterDbWithVecInstance) return betterDbWithVecInstance;
+  try {
+    const dbMod = require("better-sqlite3");
+    const sqliteVec = require("sqlite-vec");
+    const dbPath = process.env.SQLITE_FILE || path.join(os.homedir(), ".omniroute", "storage.sqlite");
+    const db = new dbMod(dbPath);
+    sqliteVec.load(db);
+    betterDbWithVecInstance = db;
+    return db;
+  } catch (err) {
+    return getDbInstance();
+  }
+}
+
+/**
+ * Sinh vector ngữ nghĩa 128 chiều chuẩn hóa L2 từ văn bản thuần túy (Không dùng Regex).
+ * Tương thích trực tiếp với bảng ảo vec0 của sqlite-vec.
+ */
+export function generateSemanticVector(text: string, dim: number = 128): Float32Array {
+  const vec = new Float32Array(dim);
+  const clean = text.toLowerCase();
+  
+  const words = clean.split(" ").map((w) => w.trim()).filter((w) => w.length > 0);
+  for (const w of words) {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x45d9f3b;
+    for (let i = 0; i < w.length; i++) {
+      const code = w.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193);
+      h2 = Math.imul(h2 ^ code, 0x5bd1e995);
+    }
+    const idx = Math.abs(h1) % dim;
+    const sign = (h2 & 1) === 0 ? 1.0 : -1.0;
+    vec[idx] += sign * (1.0 + Math.min(w.length, 8) * 0.2);
+  }
+
+  for (let i = 0; i <= clean.length - 3; i++) {
+    const gram = clean.slice(i, i + 3);
+    let h = 0x811c9dc5;
+    for (let j = 0; j < 3; j++) {
+      h = Math.imul(h ^ gram.charCodeAt(j), 0x01000193);
+    }
+    const idx = Math.abs(h) % dim;
+    vec[idx] += 0.3;
+  }
+
+  let norm = 0;
+  for (let i = 0; i < dim; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm);
+  if (norm > 0) {
+    for (let i = 0; i < dim; i++) vec[i] /= norm;
+  }
+  return vec;
+}
 
 export interface KnowledgeChunk {
   index: number;
@@ -90,6 +151,15 @@ export function ensureKnowledgeDbSchema(): void {
         tokenize = 'unicode61'
       );
     `);
+        try {
+      const vecDb = getBetterDbWithVec();
+      vecDb.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_knowledge_chunks USING vec0(
+          chunk_rowid INTEGER PRIMARY KEY,
+          embedding float[128]
+        );
+      `);
+    } catch {}
     isSchemaEnsured = true;
   } catch (err) {
     console.warn("[KnowledgeDB] Could not ensure knowledge DB schema:", err);
@@ -495,6 +565,15 @@ export async function ingestDocumentsToKnowledgeDb(
       `);
     } catch {}
 
+    let insertVec: any = null;
+    try {
+      const vecDb = getBetterDbWithVec();
+      insertVec = vecDb.prepare(`
+        INSERT OR REPLACE INTO vec_knowledge_chunks (chunk_rowid, embedding)
+        VALUES (?, ?)
+      `);
+    } catch {}
+
     for (const c of chunks) {
       const chunkId = `${docId}_${c.index}`;
       insertChunk.run(
@@ -521,6 +600,17 @@ export async function ingestDocumentsToKnowledgeDb(
             c.preview,
             c.content
           );
+        } catch {}
+      }
+
+      if (insertVec) {
+        try {
+          const rowInfo = db.prepare("SELECT rowid FROM knowledge_chunks WHERE id = ?").get(chunkId) as any;
+          if (rowInfo?.rowid) {
+            const textToEmbed = `${c.heading || ""} ${c.breadcrumb || ""} ${c.content || ""}`;
+            const v = generateSemanticVector(textToEmbed);
+            insertVec.run(BigInt(rowInfo.rowid), v);
+          }
         } catch {}
       }
     }
@@ -920,86 +1010,138 @@ export async function searchKnowledgeBase(
   const chunkMap = new Map<string, KnowledgeChunk>();
   allChunks.forEach((c) => chunkMap.set(c.id, c));
 
-  // -------------------------------------------------------------
-  // NHÁNH 1: FTS5 Full-Text Search (Sparse Search)
-  // -------------------------------------------------------------
-  const ftsRanks = new Map<string, number>();
-  const ftsMatchQuery = sanitizeQueryForFts5(query);
+  // =============================================================
+  // HYBRID RRF: SQLITE-VEC (Dense) + FTS5 (Sparse) qua better-sqlite3
+  // =============================================================
+  let candidateChunks: KnowledgeChunk[] = [];
+  try {
+    const vecDb = getBetterDbWithVec();
+    const queryVec = generateSemanticVector(query);
+    const ftsTerm = sanitizeQueryForFts5(query);
 
-  if (ftsMatchQuery) {
-    try {
-      const rows = db
-        .prepare(
-          `SELECT chunk_id, rank
-           FROM fts_knowledge_chunks
-           WHERE app_id = ? AND fts_knowledge_chunks MATCH ?
-           ORDER BY rank ASC
-           LIMIT 12`
+    const ftsClause = ftsTerm
+      ? "fts.app_id = ? AND fts_knowledge_chunks MATCH ?"
+      : "fts.app_id = ? AND fts.chunk_id IS NOT NULL";
+
+    const hybridSql = `
+      WITH vec_results AS (
+        SELECT v.chunk_rowid AS rowid,
+               ROW_NUMBER() OVER (ORDER BY v.distance ASC) AS vec_rank,
+               v.distance AS vec_distance
+        FROM vec_knowledge_chunks v
+        JOIN knowledge_chunks k ON k.rowid = v.chunk_rowid
+        WHERE v.embedding MATCH ?
+          AND k.app_id = ?
+          AND k = 10
+      ),
+      fts_results AS (
+        SELECT k.rowid,
+               ROW_NUMBER() OVER (ORDER BY fts.rank ASC) AS fts_rank,
+               fts.rank AS fts_score
+        FROM fts_knowledge_chunks fts
+        JOIN knowledge_chunks k ON k.id = fts.chunk_id
+        WHERE ${ftsClause}
+        LIMIT 10
+      ),
+      fused AS (
+        SELECT
+          rowid,
+          MAX(vec_rank) AS vec_rank,
+          MAX(fts_rank) AS fts_rank,
+          MAX(vec_distance) AS vec_distance,
+          MAX(fts_score) AS fts_score,
+          SUM(rrf_contrib) AS rrf_score
+        FROM (
+          SELECT rowid, vec_rank, NULL AS fts_rank, vec_distance, NULL AS fts_score, 1.0 / (60 + vec_rank) AS rrf_contrib
+          FROM vec_results
+          UNION ALL
+          SELECT rowid, NULL, fts_rank, NULL, fts_score, 1.0 / (60 + fts_rank) AS rrf_contrib
+          FROM fts_results
         )
-        .all(normalizedAppId, ftsMatchQuery) as Array<{ chunk_id: string; rank: number }>;
+        GROUP BY rowid
+      )
+      SELECT k.id, k.app_id, k.heading, k.breadcrumb, k.preview, k.content,
+             f.vec_rank, f.fts_rank, f.vec_distance, f.fts_score, f.rrf_score
+      FROM fused f
+      JOIN knowledge_chunks k ON k.rowid = f.rowid
+      ORDER BY f.rrf_score DESC
+      LIMIT 6;
+    `;
 
-      rows.forEach((r, idx) => {
-        ftsRanks.set(r.chunk_id, idx + 1);
-      });
-    } catch {}
+    const params = ftsTerm
+      ? [queryVec, normalizedAppId, normalizedAppId, ftsTerm]
+      : [queryVec, normalizedAppId, normalizedAppId];
+
+    const rows = vecDb.prepare(hybridSql).all(...params) as any[];
+    if (rows && rows.length > 0) {
+      candidateChunks = rows.map((r: any) => ({
+        id: r.id,
+        index: 0,
+        sourceName: r.heading || "Kiến thức DB",
+        heading: r.heading || "",
+        breadcrumb: r.breadcrumb || "",
+        preview: r.preview || "",
+        content: r.content || "",
+      }));
+    }
+  } catch (err) {
+    console.warn("[searchKnowledgeBase] Native hybrid RRF error, fallback to memory:", err);
   }
 
-  // -------------------------------------------------------------
-  // NHÁNH 2: Semantic Token / Concept Overlap (Dense Search)
-  // -------------------------------------------------------------
-  const queryTokens = extractSearchTokens(query);
-  const semanticScores: Array<{ chunkId: string; score: number }> = [];
-
-  for (const c of allChunks) {
-    let score = 0;
-    const headingLower = c.heading.toLowerCase();
-    const breadcrumbLower = c.breadcrumb.toLowerCase();
-    const previewLower = c.preview.toLowerCase();
-    const contentLower = c.content.toLowerCase();
-
-    for (const t of queryTokens) {
-      if (headingLower.includes(t)) score += 5;
-      if (breadcrumbLower.includes(t)) score += 3;
-      if (previewLower.includes(t)) score += 2;
-      if (contentLower.includes(t)) score += 1;
+  // Fallback nếu native hybrid RRF chưa có dữ liệu hoặc lỗi
+  if (candidateChunks.length === 0) {
+    const ftsRanks = new Map<string, number>();
+    const ftsMatchQuery = sanitizeQueryForFts5(query);
+    if (ftsMatchQuery) {
+      try {
+        const rows = db
+          .prepare(
+            `SELECT chunk_id, rank
+             FROM fts_knowledge_chunks
+             WHERE app_id = ? AND fts_knowledge_chunks MATCH ?
+             ORDER BY rank ASC
+             LIMIT 12`
+          )
+          .all(normalizedAppId, ftsMatchQuery) as Array<{ chunk_id: string; rank: number }>;
+        rows.forEach((r, idx) => ftsRanks.set(r.chunk_id, idx + 1));
+      } catch {}
     }
 
-    if (score > 0) {
-      semanticScores.push({ chunkId: c.id, score });
+    const queryTokens = extractSearchTokens(query);
+    const semanticScores: Array<{ chunkId: string; score: number }> = [];
+    for (const c of allChunks) {
+      let score = 0;
+      const headingLower = c.heading.toLowerCase();
+      const breadcrumbLower = c.breadcrumb.toLowerCase();
+      const previewLower = c.preview.toLowerCase();
+      const contentLower = c.content.toLowerCase();
+      for (const t of queryTokens) {
+        if (headingLower.includes(t)) score += 5;
+        if (breadcrumbLower.includes(t)) score += 3;
+        if (previewLower.includes(t)) score += 2;
+        if (contentLower.includes(t)) score += 1;
+      }
+      if (score > 0) semanticScores.push({ chunkId: c.id, score });
     }
+    semanticScores.sort((a, b) => b.score - a.score);
+    const semanticRanks = new Map<string, number>();
+    semanticScores.slice(0, 12).forEach((s, idx) => semanticRanks.set(s.chunkId, idx + 1));
+
+    const RRF_K = 60;
+    const candidateIds = new Set<string>([...ftsRanks.keys(), ...semanticRanks.keys()]);
+    const fusedScores: Array<{ chunk: KnowledgeChunk; rrfScore: number }> = [];
+    for (const id of candidateIds) {
+      const chunk = chunkMap.get(id);
+      if (!chunk) continue;
+      const fRank = ftsRanks.get(id);
+      const sRank = semanticRanks.get(id);
+      const ftsContrib = fRank ? 1.0 / (RRF_K + fRank) : 0;
+      const semContrib = sRank ? 1.0 / (RRF_K + sRank) : 0;
+      fusedScores.push({ chunk, rrfScore: ftsContrib + semContrib });
+    }
+    fusedScores.sort((a, b) => b.rrfScore - a.rrfScore);
+    candidateChunks = fusedScores.slice(0, 6).map((f) => f.chunk);
   }
-
-  semanticScores.sort((a, b) => b.score - a.score);
-  const semanticRanks = new Map<string, number>();
-  semanticScores.slice(0, 12).forEach((s, idx) => {
-    semanticRanks.set(s.chunkId, idx + 1);
-  });
-
-  // -------------------------------------------------------------
-  // FUSION: Reciprocal Rank Fusion (RRF)
-  // -------------------------------------------------------------
-  const RRF_K = 60;
-  const candidateIds = new Set<string>([...ftsRanks.keys(), ...semanticRanks.keys()]);
-  const fusedScores: Array<{ chunk: KnowledgeChunk; rrfScore: number }> = [];
-
-  for (const id of candidateIds) {
-    const chunk = chunkMap.get(id);
-    if (!chunk) continue;
-
-    const fRank = ftsRanks.get(id);
-    const sRank = semanticRanks.get(id);
-
-    const ftsContrib = fRank ? 1.0 / (RRF_K + fRank) : 0;
-    const semContrib = sRank ? 1.0 / (RRF_K + sRank) : 0;
-    const rrfScore = ftsContrib + semContrib;
-
-    fusedScores.push({ chunk, rrfScore });
-  }
-
-  fusedScores.sort((a, b) => b.rrfScore - a.rrfScore);
-
-  // Lấy danh sách Top ứng viên để đưa qua Reranker (tối đa 6 mục)
-  let candidateChunks = fusedScores.slice(0, 6).map((f) => f.chunk);
   if (candidateChunks.length === 0) {
     candidateChunks = allChunks.slice(0, 6);
   }
