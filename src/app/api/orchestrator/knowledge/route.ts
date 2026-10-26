@@ -3,6 +3,8 @@ import {
   ingestDocumentsToKnowledgeDb,
   listKnowledgeDocumentsFromDb,
   deleteKnowledgeFromDb,
+  getKnowledgeDocChunks,
+  searchKnowledgeBase,
 } from "@/lib/orchestrator/knowledgeRetriever";
 import { extractTextFromDocumentBuffer } from "@/lib/orchestrator/documentExtractor";
 
@@ -33,6 +35,32 @@ export async function GET(request: Request) {
           Data: null,
         },
         { status: 400, headers: CORS_HEADERS }
+      );
+    }
+
+    const docId = (searchParams.get("docId") || "").trim();
+    if (docId) {
+      const chunks = getKnowledgeDocChunks(appId, docId);
+      return NextResponse.json(
+        {
+          Code: 200,
+          Message: "Lấy chi tiết các chunk kiến thức thành công.",
+          Data: { docId, chunks },
+        },
+        { headers: CORS_HEADERS }
+      );
+    }
+
+    const testQuery = (searchParams.get("testQuery") || "").trim();
+    if (testQuery) {
+      const searchResult = await searchKnowledgeBase(appId, testQuery, { topK: 5 });
+      return NextResponse.json(
+        {
+          Code: 200,
+          Message: "Thử nghiệm tìm kiếm kiến thức thành công.",
+          Data: searchResult,
+        },
+        { headers: CORS_HEADERS }
       );
     }
 

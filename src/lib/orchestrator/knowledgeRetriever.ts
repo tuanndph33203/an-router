@@ -783,10 +783,71 @@ export function deleteKnowledgeFromDb(
     const res = db
       .prepare("DELETE FROM knowledge_documents WHERE app_id = ? AND folder_name = ?")
       .run(normalizedAppId, options.folderName);
+
+    try {
+      const vecDb = getBetterDbWithVec();
+      vecDb.prepare(`
+        DELETE FROM vec_knowledge_chunks
+        WHERE chunk_rowid NOT IN (SELECT rowid FROM knowledge_chunks)
+      `).run();
+    } catch {}
+
     return Number(res.changes || 0);
   }
 
+  // Dọn dẹp vector mồ côi nếu có
+  try {
+    const vecDb = getBetterDbWithVec();
+    vecDb.prepare(`
+      DELETE FROM vec_knowledge_chunks
+      WHERE chunk_rowid NOT IN (SELECT rowid FROM knowledge_chunks)
+    `).run();
+  } catch {}
+
   return 0;
+}
+
+/**
+ * Lấy danh sách các chunk kiến thức chi tiết của một tài liệu cụ thể.
+ */
+export function getKnowledgeDocChunks(appId: string, docId: string): KnowledgeChunk[] {
+  ensureKnowledgeDbSchema();
+  const normalizedAppId = (appId || "").toLowerCase().trim();
+  if (!normalizedAppId || !docId) return [];
+
+  try {
+    const db = getDbInstance();
+    const rows = db
+      .prepare(
+        `SELECT id, doc_id, source_name, heading, breadcrumb, preview, content
+         FROM knowledge_chunks
+         WHERE app_id = ? AND doc_id = ?
+         ORDER BY chunk_index ASC`
+      )
+      .all(normalizedAppId, docId) as Array<{
+      id: string;
+      doc_id: string;
+      source_name: string;
+      heading: string;
+      breadcrumb: string;
+      preview: string;
+      content: string;
+    }>;
+
+    return rows.map((r, idx) => ({
+      index: idx,
+      id: r.id,
+      docId: r.doc_id,
+      sourceName: r.source_name,
+      heading: r.heading,
+      breadcrumb: r.breadcrumb,
+      preview: r.preview,
+      content: r.content,
+    }));
+  } catch (err) {
+    console.warn("[KnowledgeDB] Failed to get doc chunks:", err);
+    return [];
+  }
 }
 
 /**
