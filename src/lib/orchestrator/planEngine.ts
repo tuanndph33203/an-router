@@ -9,12 +9,7 @@ import {
 } from "./swaggerParser";
 import { AppRegistryConfig, MissingFieldRequirement, ActionPlanStepItem } from "./types";
 import { isSqlReportEndpoint } from "./appRegistry";
-import {
-  loadKnowledgeChunksFromDb,
-  buildRuleBookCatalogForLocator,
-  assembleSelectedRuleChunks,
-  searchKnowledgeBase,
-} from "./knowledgeRetriever";
+import { searchKnowledgeBase } from "./knowledgeRetriever";
 
 export interface PlanOutput {
   thought: string;
@@ -48,11 +43,15 @@ async function fetchSchemaFromBackend(
   const cacheKey = `${schemaUrl}:${appId}:${mode}:${sortedTablesKey}`;
   const cached = schemaCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SCHEMA_CACHE_TTL_MS) {
-    console.log(`⚡ [SchemaBackend:CacheHit] mode="${mode}" | appId="${appId}" | tables=${sortedTablesKey}`);
+    console.log(
+      `⚡ [SchemaBackend:CacheHit] mode="${mode}" | appId="${appId}" | tables=${sortedTablesKey}`
+    );
     return cached.data;
   }
 
-  console.log(`🔌 [SchemaBackend:Fetch] Calling backend schema mode="${mode}" | appId="${appId}" | url="${schemaUrl}"`);
+  console.log(
+    `🔌 [SchemaBackend:Fetch] Calling backend schema mode="${mode}" | appId="${appId}" | url="${schemaUrl}"`
+  );
   if (!schemaUrl || !isSubscriptionFetchUrlAllowed(schemaUrl, { allowLocal: true })) {
     throw new Error(`URL schema không hợp lệ hoặc bị chặn: ${schemaUrl}`);
   }
@@ -176,12 +175,11 @@ export async function generateActionPlan(
     (appConfig.capabilities?.includes("sql") ?? Boolean(appConfig.schemaEndpointUrl)) &&
     Boolean(appConfig.schemaEndpointUrl);
   const sqlEndpoint = appConfig.sqlExecuteEndpoint || "/api/ai-report/execute-sql";
-
-  // Layer 1: Rule Luồng Cố Định (.md)
-  const coreFlowRules = (appConfig.domainPlaybook || "").trim();
   const knowledgeAppKey = appConfig.appId || appConfig.microsoftClientKey;
 
-  console.log(`\n🚀 [Orchestrator:PlanEngine] START generateActionPlan | instruction: "${instruction}" | appId: "${targetAppId}" | supportsSql: ${supportsSql}`);
+  console.log(
+    `\n🚀 [Orchestrator:PlanEngine] START generateActionPlan | instruction: "${instruction}" | appId: "${targetAppId}" | supportsSql: ${supportsSql}`
+  );
 
   // Danh sách công cụ (Tools) cung cấp cho AI
   const tools: any[] = [];
@@ -298,7 +296,10 @@ export async function generateActionPlan(
             type: "string",
             enum: ["direct_answer", "report_sql", "GET", "POST", "PUT", "DELETE"],
           },
-          endpoint: { type: "string", description: `Endpoint URL (ví dụ: '${sqlEndpoint}' khi là report_sql)` },
+          endpoint: {
+            type: "string",
+            description: `Endpoint URL (ví dụ: '${sqlEndpoint}' khi là report_sql)`,
+          },
           resolvedPayload: {
             type: "object",
             description:
@@ -313,7 +314,10 @@ export async function generateActionPlan(
             type: "boolean",
             description: "true nếu cần người dùng bấm xác nhận trước khi thực thi",
           },
-          confirmationMessage: { type: "string", description: "Thông điệp hiển thị khi yêu cầu xác nhận" },
+          confirmationMessage: {
+            type: "string",
+            description: "Thông điệp hiển thị khi yêu cầu xác nhận",
+          },
           missingRequiredFields: {
             type: "array",
             items: {
@@ -333,16 +337,13 @@ export async function generateActionPlan(
     },
   });
 
-  // System Prompt với Tầng 1: Rule Luồng Cố Định (.md)
+  // System Prompt tinh gọn, chỉ sử dụng Agentic Tool Loop (Multi-Search + DB Tools)
   const systemPrompt = `Bạn là Trợ lý AI Orchestrator chuyên nghiệp của ứng dụng ${appConfig.name}.
 Mô tả ứng dụng: ${appConfig.description || "Hệ thống hỗ trợ quản trị và báo cáo doanh nghiệp"}.
 Ngữ cảnh người dùng:
 - Application ID: "${targetAppId || "Không có (chế độ hỏi đáp chung)"}"
 - Chi nhánh (BranchCode): "${context?.branchCode || context?.userBranch || "Tất cả"}"
 ${Object.keys(userSuppliedInputs || {}).length > 0 ? `- Tham số người dùng đã cung cấp: ${JSON.stringify(userSuppliedInputs)}` : ""}
-
-=== TẦNG 1: RULE LUỒNG CỐ ĐỊNH (.MD) ===
-${coreFlowRules || "Không có quy tắc luồng cố định."}
 
 === NGUYÊN TẮC HÀNH ĐỘNG AGENTIC ===
 Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các quy tắc sau:
@@ -435,13 +436,18 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
 
         let toolResultStr = "";
         if (fnName === "search_knowledge") {
-          console.log(`🔍 [Orchestrator:Tool:search_knowledge] Executing searchKnowledgeBase for query: "${args.query || instruction}" (topK=${args.topK || 3})`);
+          console.log(
+            `🔍 [Orchestrator:Tool:search_knowledge] Executing searchKnowledgeBase for query: "${args.query || instruction}" (topK=${args.topK || 3})`
+          );
           onProgressStatus?.(`Đang tra cứu cơ sở tri thức: "${args.query || instruction}"...`);
           const searchRes = await searchKnowledgeBase(knowledgeAppKey, args.query || instruction, {
             topK: typeof args.topK === "number" ? args.topK : 3,
           });
-          toolResultStr = searchRes.matchedContent || "Không tìm thấy đoạn kiến thức phù hợp trong DB.";
-          console.log(`🔍 [Orchestrator:Tool:search_knowledge] Retrieved ${searchRes.topChunks?.length || 0} chunk(s) from knowledge base`);
+          toolResultStr =
+            searchRes.matchedContent || "Không tìm thấy đoạn kiến thức phù hợp trong DB.";
+          console.log(
+            `🔍 [Orchestrator:Tool:search_knowledge] Retrieved ${searchRes.topChunks?.length || 0} chunk(s) from knowledge base`
+          );
           executionSteps.push({
             stepIndex: executionSteps.length,
             name: `Tra cứu tri thức: ${args.query || instruction}`,
@@ -449,7 +455,9 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
             status: "success",
           });
         } else if (fnName === "list_tables") {
-          console.log(`📋 [Orchestrator:Tool:list_tables] Executing list_tables (keyword: "${args.keyword || '*'}")`);
+          console.log(
+            `📋 [Orchestrator:Tool:list_tables] Executing list_tables (keyword: "${args.keyword || "*"}")`
+          );
           onProgressStatus?.("Đang kiểm tra danh mục bảng CSDL...");
           try {
             const summaryData = await fetchSchemaFromBackend(
@@ -459,16 +467,23 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
               undefined,
               userAuthToken
             );
-            const allTables: string[] = Array.isArray(summaryData?.tables) ? summaryData.tables : [];
-            const keyword = String(args.keyword || "").trim().toLowerCase();
+            const allTables: string[] = Array.isArray(summaryData?.tables)
+              ? summaryData.tables
+              : [];
+            const keyword = String(args.keyword || "")
+              .trim()
+              .toLowerCase();
             const filteredTables = keyword
               ? allTables.filter((t) => t.toLowerCase().includes(keyword))
               : allTables;
-            console.log(`📋 [Orchestrator:Tool:list_tables] Found ${filteredTables.length} table(s) matching keyword`);
+            console.log(
+              `📋 [Orchestrator:Tool:list_tables] Found ${filteredTables.length} table(s) matching keyword`
+            );
             toolResultStr = JSON.stringify({
               totalTables: allTables.length,
               tables: filteredTables.slice(0, 50),
-              nextStep: "Đã có danh mục bảng. Bước tiếp theo BẮT BUỘC bạn phải gọi describe_tables với mảng các bảng liên quan nhất (ví dụ ['SaleBill', 'Branchs'] hoặc tương tự), tuyệt đối không gọi lại list_tables.",
+              nextStep:
+                "Đã có danh mục bảng. Bước tiếp theo BẮT BUỘC bạn phải gọi describe_tables với mảng các bảng liên quan nhất (ví dụ ['SaleBill', 'Branchs'] hoặc tương tự), tuyệt đối không gọi lại list_tables.",
             });
             executionSteps.push({
               stepIndex: executionSteps.length,
@@ -481,7 +496,10 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
           }
         } else if (fnName === "describe_tables") {
           const reqTables: string[] = Array.isArray(args.tables) ? args.tables.slice(0, 6) : [];
-          console.log(`📊 [Orchestrator:Tool:describe_tables] Executing describe_tables for tables:`, reqTables);
+          console.log(
+            `📊 [Orchestrator:Tool:describe_tables] Executing describe_tables for tables:`,
+            reqTables
+          );
           onProgressStatus?.(`Đang xem cấu trúc bảng: ${reqTables.join(", ")}...`);
           try {
             const detailData = await fetchSchemaFromBackend(
@@ -491,10 +509,13 @@ Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các 
               reqTables,
               userAuthToken
             );
-            console.log(`📊 [Orchestrator:Tool:describe_tables] Received schema details for ${reqTables.length} table(s)`);
+            console.log(
+              `📊 [Orchestrator:Tool:describe_tables] Received schema details for ${reqTables.length} table(s)`
+            );
             toolResultStr = JSON.stringify({
               schema: detailData || {},
-              nextStep: "Đã có cấu trúc chi tiết các cột của bảng. BẮT BUỘC gọi ngay submit_plan với action='report_sql' để sinh câu lệnh SQL an toàn.",
+              nextStep:
+                "Đã có cấu trúc chi tiết các cột của bảng. BẮT BUỘC gọi ngay submit_plan với action='report_sql' để sinh câu lệnh SQL an toàn.",
             });
             executionSteps.push({
               stepIndex: executionSteps.length,
@@ -820,69 +841,6 @@ export function extractFirstJsonArray(rawText: string): string | null {
 
 function stripCodeFences(rawText: string): string {
   return rawText.split("```json").join("").split("```").join("").trim();
-}
-
-function parseLeadingInteger(str: string): number {
-  let digits = "";
-  for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
-    if (code >= 48 && code <= 57) {
-      digits += str[i];
-    } else if (digits.length > 0) {
-      break;
-    }
-  }
-  return digits.length > 0 ? parseInt(digits, 10) : -1;
-}
-
-function parseJsonArrayOfIndices(rawText: string, maxLen: number): number[] {
-  if (!rawText) return [];
-  try {
-    const jsonCandidate = extractFirstJsonArray(rawText) || stripCodeFences(rawText);
-    const parsed = JSON.parse(jsonCandidate);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((item) => {
-        if (typeof item === "number") return item;
-        if (typeof item === "string") {
-          return parseLeadingInteger(item);
-        }
-        return -1;
-      })
-      .filter((idx) => idx >= 0 && idx < maxLen);
-  } catch (err: any) {
-    console.warn(
-      "[PlanEngine] Failed to parse API locator indices:",
-      err?.message || rawText.slice(0, 120)
-    );
-    return [];
-  }
-}
-
-function parseJsonArrayOfStrings(rawText: string, validTables: string[]): string[] {
-  if (!rawText) return [];
-  const validMap = new Map(validTables.map((t) => [t.toLowerCase(), t]));
-  try {
-    const jsonCandidate = extractFirstJsonArray(rawText) || stripCodeFences(rawText);
-    const parsed = JSON.parse(jsonCandidate);
-    if (!Array.isArray(parsed)) return [];
-    const resolved: string[] = [];
-    for (const item of parsed) {
-      if (typeof item === "string") {
-        const canonical = validMap.get(item.trim().toLowerCase());
-        if (canonical && !resolved.includes(canonical)) {
-          resolved.push(canonical);
-        }
-      }
-    }
-    return resolved;
-  } catch (err: any) {
-    console.warn(
-      "[PlanEngine] Failed to parse Table locator output:",
-      err?.message || rawText.slice(0, 120)
-    );
-    return [];
-  }
 }
 
 export function extractFirstJsonObject(rawText: string): string | null {
