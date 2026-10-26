@@ -16,6 +16,13 @@ interface ApiKeyItem {
   createdAt?: string;
 }
 
+interface AppConfigData {
+  appId: string;
+  name: string;
+  baseApiUrl: string;
+  domainPlaybook?: string;
+}
+
 interface KeyRuleMeta {
   assignedCount: number;
   ruleNames: string[];
@@ -67,8 +74,13 @@ export default function RulesUnifiedPage() {
   const [activeKey, setActiveKey] = useState<ApiKeyItem | null>(null);
 
   // State trong Popup Cấu hình
+  const [activeTab, setActiveTab] = useState<"knowledge_db" | "playbook">("knowledge_db");
   const [selectedAppId, setSelectedAppId] = useState<string>("his");
   const [customAppName, setCustomAppName] = useState<string>("HIS Medical System");
+  const [appConfig, setAppConfig] = useState<AppConfigData | null>(null);
+  const [playbookPrompt, setPlaybookPrompt] = useState<string>("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveSuccessNotice, setSaveSuccessNotice] = useState(false);
 
   // Modal Thêm Tài liệu / Kiến thức Nghiệp vụ Mới vào DB
   const [showAddRuleModal, setShowAddRuleModal] = useState(false);
@@ -493,6 +505,8 @@ export default function RulesUnifiedPage() {
   // Mở Popup Cấu hình cho 1 Key
   const handleOpenConfigModal = async (key: ApiKeyItem) => {
     setActiveKey(key);
+    setActiveTab("knowledge_db");
+    setSaveSuccessNotice(false);
 
     const existingMeta = keyRuleMap[key.id];
     let app = existingMeta?.appId || key.app_id || key.appId || "";
@@ -509,7 +523,11 @@ export default function RulesUnifiedPage() {
     await fetchKnowledgeDbForApp(app);
 
     try {
-      const rulesRes = await fetch(`/api/keys/${encodeURIComponent(key.id)}/rules`);
+      const [rulesRes, configRes] = await Promise.all([
+        fetch(`/api/keys/${encodeURIComponent(key.id)}/rules`),
+        fetch(`/api/orchestrator/app-config?appId=${encodeURIComponent(app)}`),
+      ]);
+
       if (rulesRes.ok) {
         const json = await rulesRes.json();
         if (json.Data?.appId) {
@@ -519,11 +537,43 @@ export default function RulesUnifiedPage() {
         }
         if (json.Data?.appName) setCustomAppName(json.Data.appName);
       }
+      if (configRes.ok) {
+        const json = await configRes.json();
+        setAppConfig(json.Data);
+        setPlaybookPrompt(json.Data?.domainPlaybook || "");
+      }
     } catch (e) {
       console.warn("Error loading key config:", e);
     }
 
     setShowConfigModal(true);
+  };
+
+  // Lưu cấu hình Rule cứng (Playbook)
+  const handleSaveModalConfig = async () => {
+    if (!activeKey) return;
+    setIsSaving(true);
+    try {
+      await fetch("/api/orchestrator/app-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(appConfig || { appId: selectedAppId, name: customAppName, baseApiUrl: "" }),
+          appId: selectedAppId,
+          domainPlaybook: playbookPrompt,
+        }),
+      });
+
+      setSaveSuccessNotice(true);
+      await loadInitialData();
+      setTimeout(() => {
+        setSaveSuccessNotice(false);
+      }, 1500);
+    } catch (e) {
+      console.warn("Failed to save modal config:", e);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const filteredKeys = keys.filter(
@@ -561,15 +611,15 @@ export default function RulesUnifiedPage() {
       {/* Header Banner */}
       <div className="flex items-center justify-between gap-4 bg-surface border border-border rounded-2xl px-6 py-4 shadow-xs">
         <div className="flex items-center gap-3.5">
-          <div className="size-11 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0 border border-emerald-500/20">
-            <span className="material-symbols-outlined text-2xl">database</span>
+          <div className="size-10 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center shrink-0 border border-indigo-500/20">
+            <span className="material-symbols-outlined text-2xl">menu_book</span>
           </div>
           <div>
             <h1 className="text-lg font-bold tracking-tight text-text-main">
-              Tri thức Nghiệp vụ Dự án
+              Cấu hình Tri thức &amp; Rule AI
             </h1>
             <p className="text-xs text-text-muted mt-0.5">
-              Quản lý tài liệu nghiệp vụ riêng biệt cho từng dự án
+              Quản lý tài liệu nghiệp vụ và Rule cứng hệ thống riêng biệt cho từng dự án.
             </p>
           </div>
         </div>
@@ -609,10 +659,9 @@ export default function RulesUnifiedPage() {
         </div>
 
         <div className="hidden md:grid grid-cols-12 gap-4 px-6 py-3 bg-surface/70 border-b border-border text-xs font-semibold text-text-muted">
-          <div className="col-span-3">DỰ ÁN / TÊN KHÓA API</div>
-          <div className="col-span-2">ỨNG DỤNG (APP)</div>
+          <div className="col-span-4">DỰ ÁN / TÊN KHÓA API</div>
+          <div className="col-span-3">ỨNG DỤNG (APP)</div>
           <div className="col-span-3">MÃ X-API-KEY</div>
-          <div className="col-span-2">CƠ SỞ TRI THỨC</div>
           <div className="col-span-2 text-right">THAO TÁC</div>
         </div>
 
@@ -642,7 +691,7 @@ export default function RulesUnifiedPage() {
                   key={k.id}
                   className="px-6 py-4 flex flex-col md:grid md:grid-cols-12 gap-4 items-start md:items-center hover:bg-surface/50 transition-colors"
                 >
-                  <div className="col-span-3 flex items-center gap-3.5">
+                  <div className="col-span-4 flex items-center gap-3.5">
                     <div className="size-10 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center shrink-0 border border-indigo-500/20">
                       <span className="material-symbols-outlined text-xl">vpn_key</span>
                     </div>
@@ -656,8 +705,8 @@ export default function RulesUnifiedPage() {
                     </div>
                   </div>
 
-                  <div className="col-span-2 flex flex-col gap-1 min-w-0">
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 w-fit">
+                  <div className="col-span-3 flex items-center gap-2 min-w-0">
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 shrink-0">
                       <span className="size-1.5 rounded-full bg-purple-500"></span>
                       {meta.appId}
                     </span>
@@ -672,20 +721,14 @@ export default function RulesUnifiedPage() {
                     </code>
                   </div>
 
-                  <div className="col-span-2 flex flex-wrap items-center gap-1.5">
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
-                      <span className="material-symbols-outlined text-xs">database</span>
-                      SQLite + Vector
-                    </span>
-                  </div>
-
                   <div className="col-span-2 flex items-center justify-end gap-2 w-full md:w-auto">
                     <Button
                       onClick={() => handleOpenConfigModal(k)}
-                      className="gap-1.5 text-xs bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-100 dark:hover:bg-indigo-950/70 shadow-2xs font-medium"
+                      variant="secondary"
+                      className="gap-1.5 text-xs bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-100 dark:hover:bg-indigo-950/70 font-medium"
                     >
                       <span className="material-symbols-outlined text-base">tune</span>
-                      Cấu hình Tri thức
+                      Cấu hình
                     </Button>
                   </div>
                 </div>
@@ -695,291 +738,354 @@ export default function RulesUnifiedPage() {
         )}
       </Card>
 
-      {/* POPUP CẤU HÌNH CHO TỪNG KHÓA API */}
+      {/* POPUP CẤU HÌNH CHO TỪNG DỰ ÁN */}
       <Modal
         isOpen={showConfigModal}
-        title={`Tri thức AI — ${activeKey?.name || ""}`}
+        title={`Cấu hình Tri thức: ${activeKey?.name || customAppName}`}
         onClose={() => setShowConfigModal(false)}
-        size="xl"
+        size="full"
       >
         <div className="flex flex-col gap-4 w-full">
-          {/* Thanh công cụ gọn trên 1 hàng duy nhất */}
-          <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 rounded-xl bg-surface/80 border border-border">
-            <div className="flex items-center gap-2.5">
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold uppercase bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20">
-                <span className="size-1.5 rounded-full bg-purple-500"></span>
-                {selectedAppId}
-              </span>
-              <span className="text-xs text-text-muted">•</span>
-              <span className="text-xs font-semibold text-text-main">
-                {knowledgeDocs.length} tài liệu
-              </span>
-              <span className="text-xs text-text-muted">({totalKnowledgeChunks} chunks)</span>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
+          {/* Thanh Tabs + Nút Thao Tác nằm gọn trên 1 hàng */}
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-2.5">
+            <div className="flex items-center gap-5">
               <button
                 type="button"
-                onClick={() => setShowSearchSandbox(!showSearchSandbox)}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                  showSearchSandbox
-                    ? "bg-indigo-600 text-white"
-                    : "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30 hover:bg-indigo-500/20"
+                onClick={() => setActiveTab("knowledge_db")}
+                className={`pb-2 -mb-[11px] text-xs font-semibold flex items-center gap-1.5 border-b-2 transition-all cursor-pointer ${
+                  activeTab === "knowledge_db"
+                    ? "border-indigo-600 text-indigo-600 dark:text-indigo-400"
+                    : "border-transparent text-text-muted hover:text-text-main"
                 }`}
               >
-                <span className="material-symbols-outlined text-base">search</span>
-                Test Tìm kiếm
+                <span className="material-symbols-outlined text-base">database</span>
+                Kho Tri Thức Nghiệp Vụ ({knowledgeDocs.length} tài liệu • {totalKnowledgeChunks}{" "}
+                mục)
               </button>
 
               <button
                 type="button"
-                onClick={() => {
-                  setTargetAppForNewDoc(selectedAppId);
-                  folderInputRef.current?.click();
-                }}
-                disabled={isUploadingToDb}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-border bg-surface hover:bg-black/5 dark:hover:bg-white/5 text-text-main transition-colors cursor-pointer disabled:opacity-50"
+                onClick={() => setActiveTab("playbook")}
+                className={`pb-2 -mb-[11px] text-xs font-semibold flex items-center gap-1.5 border-b-2 transition-all cursor-pointer ${
+                  activeTab === "playbook"
+                    ? "border-indigo-600 text-indigo-600 dark:text-indigo-400"
+                    : "border-transparent text-text-muted hover:text-text-main"
+                }`}
               >
-                <span className="material-symbols-outlined text-base text-amber-500">
-                  folder_open
-                </span>
-                Chọn Folder
+                <span className="material-symbols-outlined text-base">gavel</span>
+                Rule Cứng Hệ Thống
               </button>
+            </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setTargetAppForNewDoc(selectedAppId);
-                  fileInputRef.current?.click();
-                }}
-                disabled={isUploadingToDb}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition-colors cursor-pointer disabled:opacity-50"
-              >
-                <span className="material-symbols-outlined text-base">upload_file</span>
-                Chọn File
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setTargetAppForNewDoc(selectedAppId);
-                  setShowAddRuleModal(true);
-                }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-border bg-surface hover:bg-black/5 dark:hover:bg-white/5 text-text-main transition-colors cursor-pointer"
-              >
-                <span className="material-symbols-outlined text-base">edit_note</span>
-                Nhập tay
-              </button>
-
-              {knowledgeDocs.length > 0 && (
+            {activeTab === "knowledge_db" && (
+              <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onClick={handleClearAllKnowledge}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-red-600 hover:bg-red-500/10 border border-red-500/20 transition-colors cursor-pointer"
-                  title="Xóa toàn bộ tài liệu"
+                  onClick={() => setShowSearchSandbox(!showSearchSandbox)}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                    showSearchSandbox
+                      ? "bg-indigo-600 text-white"
+                      : "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/20 border border-indigo-500/20"
+                  }`}
                 >
-                  <span className="material-symbols-outlined text-base">delete</span>
+                  <span className="material-symbols-outlined text-sm">search</span>
+                  Tìm thử
                 </button>
-              )}
-            </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTargetAppForNewDoc(selectedAppId);
+                    fileInputRef.current?.click();
+                  }}
+                  disabled={isUploadingToDb}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 hover:bg-emerald-700 text-white transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-sm">upload_file</span>
+                  Chọn File
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTargetAppForNewDoc(selectedAppId);
+                    folderInputRef.current?.click();
+                  }}
+                  disabled={isUploadingToDb}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-surface hover:bg-black/5 dark:hover:bg-white/5 text-text-main border border-border transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-sm">folder_open</span>
+                  Chọn Folder
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTargetAppForNewDoc(selectedAppId);
+                    setShowAddRuleModal(true);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-surface hover:bg-black/5 dark:hover:bg-white/5 text-text-main border border-border transition-colors cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-sm">edit_note</span>
+                  Nhập tay
+                </button>
+
+                {knowledgeDocs.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleClearAllKnowledge}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-600 hover:bg-red-500/10 border border-red-500/20 transition-colors cursor-pointer"
+                    title="Xóa toàn bộ tài liệu"
+                  >
+                    <span className="material-symbols-outlined text-sm">delete_sweep</span>
+                    Xóa hết
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
-          {/* Thông báo tiến trình nạp */}
-          {knowledgeUploadMsg && (
-            <div className="px-3.5 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="material-symbols-outlined text-base text-emerald-600">
-                  check_circle
-                </span>
-                <span className="font-medium">{knowledgeUploadMsg}</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setKnowledgeUploadMsg(null)}
-                className="text-text-muted hover:text-text-main cursor-pointer"
-              >
-                <span className="material-symbols-outlined text-sm">close</span>
-              </button>
-            </div>
-          )}
+          {activeTab === "knowledge_db" && (
+            <div className="space-y-3">
+              {/* Thông báo tiến trình nạp */}
+              {knowledgeUploadMsg && (
+                <div className="px-3 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="material-symbols-outlined text-base text-emerald-600">
+                      check_circle
+                    </span>
+                    <span>{knowledgeUploadMsg}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setKnowledgeUploadMsg(null)}
+                    className="text-text-muted hover:text-text-main cursor-pointer"
+                  >
+                    <span className="material-symbols-outlined text-sm">close</span>
+                  </button>
+                </div>
+              )}
 
-          {/* SANDBOX THỬ NGHIỆM TÌM KIẾM */}
-          {showSearchSandbox && (
-            <div className="p-3.5 rounded-xl bg-indigo-500/5 border border-indigo-500/25 space-y-2.5">
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={testSearchQuery}
-                  onChange={(e) => setTestSearchQuery(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handleExecuteTestSearch();
-                  }}
-                  placeholder="Nhập câu hỏi nghiệp vụ để kiểm tra kết quả trích xuất..."
-                  className="flex-1 text-xs px-3 py-2 rounded-lg border border-border bg-surface text-text-main focus:outline-hidden focus:border-indigo-500"
-                />
-                <button
-                  type="button"
-                  onClick={handleExecuteTestSearch}
-                  disabled={isTestingSearch}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white shrink-0 cursor-pointer disabled:opacity-50"
-                >
-                  <span className="material-symbols-outlined text-base">search</span>
-                  {isTestingSearch ? "Đang tìm..." : "Tìm thử"}
-                </button>
-              </div>
+              {/* SANDBOX THỬ NGHIỆM TÌM KIẾM */}
+              {showSearchSandbox && (
+                <div className="p-3.5 rounded-xl bg-surface/80 border border-indigo-500/30 space-y-2.5">
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={testSearchQuery}
+                      onChange={(e) => setTestSearchQuery(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleExecuteTestSearch();
+                      }}
+                      placeholder="Nhập câu hỏi nghiệp vụ cần kiểm tra kết quả trích xuất..."
+                      className="flex-1 text-xs px-3 py-2 rounded-lg border border-border bg-surface text-text-main focus:outline-hidden focus:border-indigo-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleExecuteTestSearch}
+                      disabled={isTestingSearch}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium bg-indigo-600 hover:bg-indigo-700 text-white shrink-0 cursor-pointer disabled:opacity-50"
+                    >
+                      <span className="material-symbols-outlined text-sm">search</span>
+                      {isTestingSearch ? "Đang tìm..." : "Kiểm tra"}
+                    </button>
+                  </div>
 
-              {testSearchResult && (
-                <div className="pt-2 border-t border-indigo-500/20">
-                  {testSearchResult.isGreeting ? (
-                    <div className="p-2.5 rounded-lg bg-blue-500/10 border border-blue-500/30 text-blue-700 dark:text-blue-300 text-xs">
-                      👋 Câu chào hỏi: <em>&quot;{testSearchResult.greetingReply}&quot;</em>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                      {testSearchResult.topChunks?.map((chunk: any, i: number) => (
-                        <div
-                          key={chunk.id || i}
-                          className="p-2.5 rounded-lg border border-emerald-500/30 bg-surface text-xs space-y-1"
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
-                              #{i + 1}
-                            </span>
-                            <span className="font-mono text-[10px] text-text-muted truncate max-w-[180px]">
-                              {chunk.breadcrumb}
-                            </span>
-                          </div>
-                          <h4 className="font-bold text-text-main text-xs">{chunk.heading}</h4>
-                          <p className="text-text-muted text-[11px] line-clamp-3 font-mono">
-                            {chunk.content}
-                          </p>
+                  {testSearchResult && (
+                    <div className="pt-2 border-t border-border space-y-2">
+                      {testSearchResult.isGreeting ? (
+                        <div className="p-2.5 rounded-lg bg-blue-500/10 border border-blue-500/20 text-blue-700 dark:text-blue-300 text-xs">
+                          👋 Phản hồi chào hỏi:{" "}
+                          <em>&quot;{testSearchResult.greetingReply}&quot;</em>
                         </div>
-                      ))}
+                      ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                          {testSearchResult.topChunks?.map((chunk: any, i: number) => (
+                            <div
+                              key={chunk.id || i}
+                              className="p-2.5 rounded-lg border border-border bg-surface text-xs space-y-1"
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
+                                  #{i + 1}
+                                </span>
+                                <span className="font-mono text-[10px] text-text-muted truncate max-w-[200px]">
+                                  {chunk.breadcrumb}
+                                </span>
+                              </div>
+                              <h4 className="font-semibold text-text-main text-xs">
+                                {chunk.heading}
+                              </h4>
+                              <p className="text-text-muted text-[11px] line-clamp-3 font-mono">
+                                {chunk.content}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* VÙNG KÉO THẢ GỌN GÀNG */}
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsDraggingOver(true);
+                }}
+                onDragLeave={() => setIsDraggingOver(false)}
+                onDrop={handleDropFiles}
+                className={`rounded-xl border border-dashed transition-all flex items-center justify-center text-center ${
+                  knowledgeDocs.length === 0 ? "p-8 flex-col gap-2" : "px-4 py-2.5 gap-2.5"
+                } ${
+                  isDraggingOver
+                    ? "border-emerald-500 bg-emerald-500/10"
+                    : "border-border bg-surface/40 hover:bg-surface/70"
+                }`}
+              >
+                <span className="material-symbols-outlined text-xl text-emerald-600 dark:text-emerald-400">
+                  {isUploadingToDb ? "sync" : "cloud_upload"}
+                </span>
+                <div>
+                  <p className="text-xs font-medium text-text-main">
+                    {isUploadingToDb
+                      ? "Đang xử lý và lưu tài liệu..."
+                      : knowledgeDocs.length === 0
+                        ? "Chưa có tài liệu nào. Kéo thả file hoặc folder vào đây để tải lên"
+                        : "Kéo thả thêm file hoặc folder vào đây để bổ sung"}
+                  </p>
+                  <p className="text-[11px] text-text-muted mt-0.5">
+                    Hỗ trợ: .pdf, .docx, .doc, .md, .json, .csv, .txt
+                  </p>
+                </div>
+              </div>
+
+              {/* DANH SÁCH THƯ MỤC & TÀI LIỆU */}
+              {knowledgeFolders.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {knowledgeFolders.map((folder) => (
+                    <span
+                      key={folder}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-surface border border-border text-text-main text-xs font-mono"
+                    >
+                      <span className="material-symbols-outlined text-sm text-amber-500">
+                        folder
+                      </span>
+                      {folder}
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteKnowledgeFolder(selectedAppId, folder)}
+                        className="ml-1 text-text-muted hover:text-red-500 cursor-pointer"
+                        title={`Xóa folder ${folder}`}
+                      >
+                        <span className="material-symbols-outlined text-xs">close</span>
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {knowledgeDocs.length > 0 && (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 max-h-72 overflow-y-auto pr-1">
+                  {knowledgeDocs.map((doc) => {
+                    const lower = doc.relativePath.toLowerCase();
+                    const isPdf = lower.endsWith(".pdf");
+                    const isDocx = lower.endsWith(".docx") || lower.endsWith(".doc");
+
+                    return (
+                      <div
+                        key={doc.id}
+                        className="flex items-center justify-between gap-2 p-2.5 rounded-xl border border-border bg-surface hover:border-indigo-500/40 transition-colors text-xs"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span
+                            className={`material-symbols-outlined text-lg shrink-0 ${
+                              isPdf ? "text-red-500" : isDocx ? "text-blue-500" : "text-indigo-500"
+                            }`}
+                          >
+                            {isPdf ? "picture_as_pdf" : isDocx ? "article" : "description"}
+                          </span>
+                          <div className="min-w-0">
+                            <p
+                              className="font-mono font-semibold text-text-main truncate text-xs"
+                              title={doc.relativePath}
+                            >
+                              {doc.relativePath}
+                            </p>
+                            <p className="text-[11px] text-text-muted">
+                              {(doc.rawSize / 1024).toFixed(1)} KB • {doc.chunkCount} mục
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleInspectDocChunks(doc)}
+                            className="p-1.5 rounded-lg text-text-muted hover:text-indigo-600 hover:bg-indigo-500/10 cursor-pointer"
+                            title="Xem chi tiết các mục (Chunks)"
+                          >
+                            <span className="material-symbols-outlined text-base">visibility</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteKnowledgeDoc(selectedAppId, doc.id)}
+                            className="p-1.5 rounded-lg text-text-muted hover:text-red-500 hover:bg-red-500/10 cursor-pointer"
+                            title="Xóa tài liệu"
+                          >
+                            <span className="material-symbols-outlined text-base">delete</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
           )}
 
-          {/* VÙNG KÉO THẢ TÀI LIỆU */}
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDraggingOver(true);
-            }}
-            onDragLeave={() => setIsDraggingOver(false)}
-            onDrop={handleDropFiles}
-            onClick={() => {
-              setTargetAppForNewDoc(selectedAppId);
-              fileInputRef.current?.click();
-            }}
-            className={`py-5 px-4 rounded-xl border border-dashed transition-all flex flex-col items-center justify-center text-center gap-1.5 cursor-pointer ${
-              isDraggingOver
-                ? "border-emerald-500 bg-emerald-500/10"
-                : "border-border hover:border-emerald-500/50 bg-surface/40 hover:bg-surface/80"
-            }`}
-          >
-            <span className="material-symbols-outlined text-2xl text-emerald-600 dark:text-emerald-400">
-              {isUploadingToDb ? "sync" : "cloud_upload"}
+          {activeTab === "playbook" && (
+            <div className="space-y-2">
+              <p className="text-xs text-text-muted">
+                Rule cứng luôn được truyền cố định vào System Prompt của dự án{" "}
+                <strong className="text-text-main uppercase">{selectedAppId}</strong> ở mọi lượt hội
+                thoại:
+              </p>
+              <textarea
+                value={playbookPrompt}
+                onChange={(e) => setPlaybookPrompt(e.target.value)}
+                placeholder="Nhập các quy tắc bắt buộc cho AI của dự án này (VD: Luôn lọc IsDeleted = 0, định dạng tiền tệ VNĐ, quy tắc ánh xạ chi nhánh)..."
+                rows={11}
+                className="w-full text-xs font-mono p-3.5 rounded-xl border border-border bg-surface text-text-main focus:outline-hidden focus:border-indigo-500 leading-relaxed"
+              />
+            </div>
+          )}
+
+          <div className="flex items-center justify-between pt-3 border-t border-border">
+            <span className="text-xs text-emerald-600 font-semibold">
+              {saveSuccessNotice && "✓ Đã lưu Rule cứng thành công!"}
             </span>
-            <p className="text-xs font-semibold text-text-main">
-              {isUploadingToDb
-                ? "Đang xử lý và nạp tài liệu..."
-                : "Kéo & thả file hoặc bấm vào đây để tải tài liệu lên"}
-            </p>
-            <p className="text-[11px] text-text-muted">
-              Hỗ trợ: PDF, Word (.docx, .doc), Markdown (.md), JSON, CSV, TXT
-            </p>
-          </div>
-
-          {/* DANH SÁCH THƯ MỤC */}
-          {knowledgeFolders.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">
-              {knowledgeFolders.map((folder) => (
-                <span
-                  key={folder}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-surface border border-border text-text-main text-xs font-mono"
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={() => setShowConfigModal(false)}
+                variant="ghost"
+                className="text-xs px-4"
+              >
+                Đóng
+              </Button>
+              {activeTab === "playbook" && (
+                <button
+                  type="button"
+                  onClick={handleSaveModalConfig}
+                  disabled={isSaving}
+                  className="px-4 py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white transition-colors cursor-pointer disabled:opacity-50"
                 >
-                  <span className="material-symbols-outlined text-sm text-amber-500">folder</span>
-                  {folder}
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteKnowledgeFolder(selectedAppId, folder)}
-                    className="ml-0.5 text-text-muted hover:text-red-500 cursor-pointer"
-                    title={`Xóa folder ${folder}`}
-                  >
-                    <span className="material-symbols-outlined text-xs">close</span>
-                  </button>
-                </span>
-              ))}
+                  {isSaving ? "Đang lưu..." : "Lưu Rule Cứng"}
+                </button>
+              )}
             </div>
-          )}
-
-          {/* DANH SÁCH TÀI LIỆU (CHỈ HIỂN THỊ KHI CÓ TÀI LIỆU) */}
-          {knowledgeDocs.length > 0 && (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 max-h-72 overflow-y-auto pr-1">
-              {knowledgeDocs.map((doc) => {
-                const lower = doc.relativePath.toLowerCase();
-                const isPdf = lower.endsWith(".pdf");
-                const isDocx = lower.endsWith(".docx") || lower.endsWith(".doc");
-                const isMd = lower.endsWith(".md") || lower.endsWith(".markdown");
-
-                return (
-                  <div
-                    key={doc.id}
-                    className="flex items-center justify-between gap-2 p-2.5 rounded-xl border border-border bg-surface hover:border-emerald-500/40 transition-colors text-xs"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span
-                        className={`material-symbols-outlined text-lg shrink-0 ${
-                          isPdf
-                            ? "text-red-500"
-                            : isDocx
-                              ? "text-blue-500"
-                              : isMd
-                                ? "text-indigo-500"
-                                : "text-emerald-600"
-                        }`}
-                      >
-                        {isPdf ? "picture_as_pdf" : isDocx ? "article" : "description"}
-                      </span>
-                      <div className="min-w-0">
-                        <p
-                          className="font-mono font-semibold text-text-main truncate text-xs"
-                          title={doc.relativePath}
-                        >
-                          {doc.relativePath}
-                        </p>
-                        <p className="text-[11px] text-text-muted">
-                          {(doc.rawSize / 1024).toFixed(1)} KB • {doc.chunkCount} chunks
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => handleInspectDocChunks(doc)}
-                        className="p-1.5 rounded-lg text-text-muted hover:text-emerald-600 hover:bg-emerald-500/10 cursor-pointer"
-                        title="Xem chi tiết các chunk"
-                      >
-                        <span className="material-symbols-outlined text-base">visibility</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteKnowledgeDoc(selectedAppId, doc.id)}
-                        className="p-1.5 rounded-lg text-text-muted hover:text-red-500 hover:bg-red-500/10 cursor-pointer"
-                        title="Xóa tài liệu"
-                      >
-                        <span className="material-symbols-outlined text-base">delete</span>
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+          </div>
         </div>
       </Modal>
 

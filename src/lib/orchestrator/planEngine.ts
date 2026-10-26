@@ -175,6 +175,7 @@ export async function generateActionPlan(
     (appConfig.capabilities?.includes("sql") ?? Boolean(appConfig.schemaEndpointUrl)) &&
     Boolean(appConfig.schemaEndpointUrl);
   const sqlEndpoint = appConfig.sqlExecuteEndpoint || "/api/ai-report/execute-sql";
+  const coreFlowRules = (appConfig.domainPlaybook || "").trim();
   const knowledgeAppKey = appConfig.appId || appConfig.microsoftClientKey;
 
   console.log(
@@ -337,13 +338,13 @@ export async function generateActionPlan(
     },
   });
 
-  // System Prompt tinh gọn, chỉ sử dụng Agentic Tool Loop (Multi-Search + DB Tools)
+  // System Prompt kết hợp Rule Cứng Hệ Thống + Agentic Tool Loop (Multi-Search + DB Tools)
   const systemPrompt = `Bạn là Trợ lý AI Orchestrator chuyên nghiệp của ứng dụng ${appConfig.name}.
 Mô tả ứng dụng: ${appConfig.description || "Hệ thống hỗ trợ quản trị và báo cáo doanh nghiệp"}.
 Ngữ cảnh người dùng:
 - Application ID: "${targetAppId || "Không có (chế độ hỏi đáp chung)"}"
 - Chi nhánh (BranchCode): "${context?.branchCode || context?.userBranch || "Tất cả"}"
-${Object.keys(userSuppliedInputs || {}).length > 0 ? `- Tham số người dùng đã cung cấp: ${JSON.stringify(userSuppliedInputs)}` : ""}
+${Object.keys(userSuppliedInputs || {}).length > 0 ? `- Tham số người dùng đã cung cấp: ${JSON.stringify(userSuppliedInputs)}` : ""}${coreFlowRules ? `\n\n=== RULE CỨNG HỆ THỐNG ===\n${coreFlowRules}` : ""}
 
 === NGUYÊN TẮC HÀNH ĐỘNG AGENTIC ===
 Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các quy tắc sau:
