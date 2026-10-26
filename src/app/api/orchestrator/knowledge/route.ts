@@ -4,6 +4,7 @@ import {
   listKnowledgeDocumentsFromDb,
   deleteKnowledgeFromDb,
   getKnowledgeDocChunks,
+  updateKnowledgeChunkInDb,
   searchKnowledgeBase,
 } from "@/lib/orchestrator/knowledgeRetriever";
 import { extractTextFromDocumentBuffer } from "@/lib/orchestrator/documentExtractor";
@@ -12,7 +13,7 @@ export const dynamic = "force-dynamic";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, accept",
 };
 
@@ -185,10 +186,24 @@ export async function POST(request: Request) {
     const ingestResult = await ingestDocumentsToKnowledgeDb(appId, docsToIngest);
     const updatedList = listKnowledgeDocumentsFromDb(appId);
 
+    const firstDiff = ingestResult.diffDetails?.[0];
+    let customMsg = `Đã nạp ${ingestResult.documentsSaved} tài liệu (${ingestResult.totalChunksSaved} mục kiến thức) vào SQLite DB.`;
+    if (firstDiff && ingestResult.diffDetails?.length === 1) {
+      if (firstDiff.isUnchanged) {
+        customMsg = `⚡ Tài liệu "${firstDiff.docName}" không thay đổi (Giữ nguyên ${firstDiff.retainedChunks} mục).`;
+      } else if (
+        firstDiff.retainedChunks > 0 ||
+        firstDiff.updatedChunks > 0 ||
+        firstDiff.removedChunks > 0
+      ) {
+        customMsg = `✨ Cập nhật "${firstDiff.docName}": Giữ nguyên ${firstDiff.retainedChunks} mục, sửa ${firstDiff.updatedChunks} mục, thêm ${firstDiff.addedChunks} mục, xóa ${firstDiff.removedChunks} mục cũ.`;
+      }
+    }
+
     return NextResponse.json(
       {
         Code: 200,
-        Message: `Đã nạp trực tiếp ${ingestResult.documentsSaved} tài liệu (${ingestResult.totalChunksSaved} mục kiến thức) vào SQLite DB cho '${appId}'.`,
+        Message: customMsg,
         Data: {
           ...ingestResult,
           ...updatedList,
@@ -202,6 +217,79 @@ export async function POST(request: Request) {
       {
         Code: 500,
         Message: err?.message || "Lỗi khi lưu tài liệu vào DB Kiến thức.",
+        Data: null,
+      },
+      { status: 500, headers: CORS_HEADERS }
+    );
+  }
+}
+
+export async function PUT(request: Request) {
+  try {
+    const body = await request.json();
+    const appId = String(body?.appId || "")
+      .trim()
+      .toLowerCase();
+    const docId = String(body?.docId || "").trim();
+    const chunkId = String(body?.chunkId || "").trim();
+    const heading = String(body?.heading || "").trim();
+    const content = String(body?.content || "").trim();
+    const preview = body?.preview ? String(body.preview).trim() : undefined;
+
+    if (!appId || !docId || !chunkId) {
+      return NextResponse.json(
+        {
+          Code: 400,
+          Message: "Thiếu appId, docId hoặc chunkId.",
+          Data: null,
+        },
+        { status: 400, headers: CORS_HEADERS }
+      );
+    }
+
+    if (!content) {
+      return NextResponse.json(
+        {
+          Code: 400,
+          Message: "Nội dung mục kiến thức không được để trống.",
+          Data: null,
+        },
+        { status: 400, headers: CORS_HEADERS }
+      );
+    }
+
+    const ok = updateKnowledgeChunkInDb(appId, docId, chunkId, {
+      heading,
+      content,
+      preview,
+    });
+
+    if (!ok) {
+      return NextResponse.json(
+        {
+          Code: 404,
+          Message: "Không tìm thấy mục tri thức cần cập nhật.",
+          Data: null,
+        },
+        { status: 404, headers: CORS_HEADERS }
+      );
+    }
+
+    const updatedChunks = getKnowledgeDocChunks(appId, docId);
+    return NextResponse.json(
+      {
+        Code: 200,
+        Message: "Đã cập nhật mục tri thức và chỉ mục vector thành công.",
+        Data: { docId, chunks: updatedChunks },
+      },
+      { headers: CORS_HEADERS }
+    );
+  } catch (err: any) {
+    console.error("[KnowledgeDB PUT] Error:", err);
+    return NextResponse.json(
+      {
+        Code: 500,
+        Message: err?.message || "Lỗi khi cập nhật mục tri thức.",
         Data: null,
       },
       { status: 500, headers: CORS_HEADERS }

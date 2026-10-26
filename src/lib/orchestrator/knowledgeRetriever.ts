@@ -4,7 +4,6 @@ import os from "os";
 import { getDbInstance } from "@/lib/db/core";
 import { callInternalLlm } from "./planEngine";
 
-
 let betterDbWithVecInstance: any = null;
 
 export function getBetterDbWithVec(): any {
@@ -12,12 +11,13 @@ export function getBetterDbWithVec(): any {
   try {
     const dbMod = require("better-sqlite3");
     const sqliteVec = require("sqlite-vec");
-    const dbPath = process.env.SQLITE_FILE || path.join(os.homedir(), ".omniroute", "storage.sqlite");
+    const dbPath =
+      process.env.SQLITE_FILE || path.join(os.homedir(), ".omniroute", "storage.sqlite");
     const db = new dbMod(dbPath);
     sqliteVec.load(db);
     betterDbWithVecInstance = db;
     return db;
-  } catch (err) {
+  } catch (_err) {
     return getDbInstance();
   }
 }
@@ -29,8 +29,11 @@ export function getBetterDbWithVec(): any {
 export function generateSemanticVector(text: string, dim: number = 128): Float32Array {
   const vec = new Float32Array(dim);
   const clean = text.toLowerCase();
-  
-  const words = clean.split(" ").map((w) => w.trim()).filter((w) => w.length > 0);
+
+  const words = clean
+    .split(" ")
+    .map((w) => w.trim())
+    .filter((w) => w.length > 0);
   for (const w of words) {
     let h1 = 0x811c9dc5;
     let h2 = 0x45d9f3b;
@@ -72,6 +75,7 @@ export interface KnowledgeChunk {
   breadcrumb: string;
   preview: string;
   content: string;
+  sectionHash?: string;
 }
 
 export interface KnowledgeDocumentSummary {
@@ -83,6 +87,26 @@ export interface KnowledgeDocumentSummary {
   rawSize: number;
   chunkCount: number;
   updatedAt: string;
+  rawContent?: string;
+}
+
+export interface DocumentSection {
+  index: number;
+  heading: string;
+  breadcrumb: string;
+  content: string;
+  hash: string;
+}
+
+export interface KnowledgeDiffDetail {
+  docName: string;
+  relativePath: string;
+  retainedChunks: number;
+  updatedChunks: number;
+  addedChunks: number;
+  removedChunks: number;
+  totalChunks: number;
+  isUnchanged: boolean;
 }
 
 let isSchemaEnsured = false;
@@ -102,6 +126,7 @@ export function ensureKnowledgeDbSchema(): void {
         doc_name TEXT NOT NULL,
         folder_name TEXT NOT NULL DEFAULT '',
         relative_path TEXT NOT NULL,
+        raw_content TEXT NOT NULL DEFAULT '',
         content_hash TEXT NOT NULL,
         raw_size INTEGER NOT NULL DEFAULT 0,
         chunk_count INTEGER NOT NULL DEFAULT 0,
@@ -120,11 +145,21 @@ export function ensureKnowledgeDbSchema(): void {
         breadcrumb TEXT NOT NULL,
         preview TEXT NOT NULL,
         content TEXT NOT NULL,
+        section_hash TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
       );
     `);
 
-    // Tự động nâng cấp bảng knowledge_chunks cũ nếu thiếu cột doc_id hoặc relative_path
+    // Tự động nâng cấp bảng knowledge_documents nếu thiếu cột raw_content
+    const docCols = db.prepare("PRAGMA table_info(knowledge_documents)").all() as Array<{
+      name: string;
+    }>;
+    const docColNames = new Set(docCols.map((c) => c.name));
+    if (!docColNames.has("raw_content")) {
+      db.exec("ALTER TABLE knowledge_documents ADD COLUMN raw_content TEXT NOT NULL DEFAULT ''");
+    }
+
+    // Tự động nâng cấp bảng knowledge_chunks cũ nếu thiếu cột doc_id, relative_path hoặc section_hash
     const cols = db.prepare("PRAGMA table_info(knowledge_chunks)").all() as Array<{ name: string }>;
     const colNames = new Set(cols.map((c) => c.name));
     if (!colNames.has("doc_id")) {
@@ -133,6 +168,9 @@ export function ensureKnowledgeDbSchema(): void {
     if (!colNames.has("relative_path")) {
       db.exec("ALTER TABLE knowledge_chunks ADD COLUMN relative_path TEXT NOT NULL DEFAULT ''");
     }
+    if (!colNames.has("section_hash")) {
+      db.exec("ALTER TABLE knowledge_chunks ADD COLUMN section_hash TEXT NOT NULL DEFAULT ''");
+    }
 
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_knowledge_docs_app
@@ -140,6 +178,9 @@ export function ensureKnowledgeDbSchema(): void {
 
       CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_app
         ON knowledge_chunks(app_id, doc_id, chunk_index);
+
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_section_hash
+        ON knowledge_chunks(app_id, doc_id, section_hash);
 
       CREATE VIRTUAL TABLE IF NOT EXISTS fts_knowledge_chunks USING fts5(
         chunk_id UNINDEXED,
@@ -151,7 +192,7 @@ export function ensureKnowledgeDbSchema(): void {
         tokenize = 'unicode61'
       );
     `);
-        try {
+    try {
       const vecDb = getBetterDbWithVec();
       vecDb.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_knowledge_chunks USING vec0(
@@ -480,8 +521,135 @@ YÊU CẦU BẮT BUỘC:
 }
 
 /**
+ * Tách tài liệu thành các khối/phân đoạn nghiệp vụ logic (Document Sections) kèm mã băm SHA-256.
+ * Hỗ trợ cả Markdown có tiêu đề (#, ##, ###) và văn bản thuần / Word .docx trích xuất theo đoạn.
+ * Hoàn toàn không dùng Regex.
+ */
+export function splitDocumentIntoSections(
+  rawContent: string,
+  sourceName: string
+): DocumentSection[] {
+  if (!rawContent || !rawContent.trim()) return [];
+
+  const lines = rawContent.split("\n");
+  const sections: DocumentSection[] = [];
+
+  const hasHeadings =
+    rawContent.includes("# ") || rawContent.includes("## ") || rawContent.includes("### ");
+
+  if (hasHeadings) {
+    let currentHeading = "Mục mở đầu";
+    let currentBreadcrumb = `[Nguồn: ${sourceName}]`;
+    let currentLines: string[] = [];
+    let h1 = "";
+    let h2 = "";
+    let h3 = "";
+
+    const flush = () => {
+      const body = currentLines.join("\n").trim();
+      currentLines = [];
+      if (!body || body.length < 10) return;
+
+      const hash = createHash("sha256").update(collapseWhitespace(body)).digest("hex").slice(0, 24);
+
+      sections.push({
+        index: sections.length,
+        heading: currentHeading,
+        breadcrumb: currentBreadcrumb,
+        content: body,
+        hash,
+      });
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      const trimmed = line.trim();
+
+      if (trimmed.startsWith("### ")) {
+        flush();
+        h3 = trimmed.slice(4).trim();
+        currentHeading = h3 || h2 || h1 || "Mục kiến thức";
+        currentBreadcrumb = `[Nguồn: ${sourceName} > ${[h1, h2, h3].filter(Boolean).join(" > ")}]`;
+        currentLines.push(line);
+      } else if (trimmed.startsWith("## ")) {
+        flush();
+        h2 = trimmed.slice(3).trim();
+        h3 = "";
+        currentHeading = h2 || h1 || "Mục kiến thức";
+        currentBreadcrumb = `[Nguồn: ${sourceName} > ${[h1, h2].filter(Boolean).join(" > ")}]`;
+        currentLines.push(line);
+      } else if (trimmed.startsWith("# ")) {
+        flush();
+        h1 = trimmed.slice(2).trim();
+        h2 = "";
+        h3 = "";
+        currentHeading = h1 || "Mục kiến thức";
+        currentBreadcrumb = `[Nguồn: ${sourceName} > ${h1}]`;
+        currentLines.push(line);
+      } else {
+        currentLines.push(line);
+      }
+    }
+
+    flush();
+  } else {
+    // Văn bản không có Markdown headings (như Word .docx hoặc plain text)
+    // Gom theo các đoạn văn tự nhiên (khoảng 200-400 từ hoặc cách nhau bởi dòng trống)
+    let currentLines: string[] = [];
+    let wordCount = 0;
+
+    const flush = () => {
+      const body = currentLines.join("\n").trim();
+      currentLines = [];
+      wordCount = 0;
+      if (!body || body.length < 15) return;
+
+      const idx = sections.length;
+      const heading = `Đoạn văn ${idx + 1} (${sourceName})`;
+      const breadcrumb = `[Nguồn: ${sourceName} > Đoạn ${idx + 1}]`;
+      const hash = createHash("sha256").update(collapseWhitespace(body)).digest("hex").slice(0, 24);
+
+      sections.push({
+        index: idx,
+        heading,
+        breadcrumb,
+        content: body,
+        hash,
+      });
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      const trimmed = line.trim();
+
+      if (!trimmed) {
+        if (wordCount >= 250) {
+          flush();
+        }
+        continue;
+      }
+
+      const words = trimmed.split(" ").filter(Boolean).length;
+      currentLines.push(line);
+      wordCount += words;
+
+      if (wordCount >= 400) {
+        flush();
+      }
+    }
+
+    flush();
+  }
+
+  return sections;
+}
+
+/**
  * Nạp (Ingest) danh sách tài liệu từ Folder hoặc File trực tiếp vào SQLite DB (`knowledge_documents` & `knowledge_chunks`).
- * Không tạo file vật lý trong thư mục `rules/`.
+ * Áp dụng cơ chế Section Hash Diff thông minh:
+ * - Nếu tài liệu không đổi: Bỏ qua 100%, không tốn token AI.
+ * - Nếu tài liệu có sửa đổi 1 phần: Chỉ phân tích lại đúng các section thay đổi, giữ nguyên các chunk cũ.
+ * - Nếu xóa bớt phần nào: Tự động dọn dẹp các chunk cũ tương ứng.
  */
 export async function ingestDocumentsToKnowledgeDb(
   appId: string,
@@ -490,6 +658,7 @@ export async function ingestDocumentsToKnowledgeDb(
   documentsSaved: number;
   totalChunksSaved: number;
   items: KnowledgeDocumentSummary[];
+  diffDetails: KnowledgeDiffDetail[];
 }> {
   ensureKnowledgeDbSchema();
   const normalizedAppId = (appId || "").toLowerCase().trim();
@@ -497,13 +666,16 @@ export async function ingestDocumentsToKnowledgeDb(
     throw new Error("Thiếu mã ứng dụng (appId) khi lưu vào DB Kiến thức.");
   }
 
-  console.log(`📥 [KnowledgeRetriever:Ingest] Starting ingestion of ${documents.length} doc(s) for appId="${normalizedAppId}"`);
+  console.log(
+    `📥 [KnowledgeRetriever:Ingest] Starting ingestion of ${documents.length} doc(s) for appId="${normalizedAppId}"`
+  );
 
   const db = getDbInstance();
   const now = new Date().toISOString();
   let documentsSaved = 0;
   let totalChunksSaved = 0;
   const savedSummaries: KnowledgeDocumentSummary[] = [];
+  const diffDetails: KnowledgeDiffDetail[] = [];
 
   for (const doc of documents) {
     const rawContent = (doc.content || "").trim();
@@ -527,35 +699,161 @@ export async function ingestDocumentsToKnowledgeDb(
 
     const existingDoc = db
       .prepare(
-        "SELECT id, content_hash FROM knowledge_documents WHERE app_id = ? AND relative_path = ?"
+        "SELECT id, content_hash, raw_content, chunk_count FROM knowledge_documents WHERE app_id = ? AND relative_path = ?"
       )
-      .get(normalizedAppId, cleanRelPath) as { id: string; content_hash: string } | undefined;
+      .get(normalizedAppId, cleanRelPath) as
+      { id: string; content_hash: string; raw_content?: string; chunk_count: number } | undefined;
 
     const docId = existingDoc?.id || `kdoc_${randomUUID().split("-").join("").slice(0, 16)}`;
 
-    // Tích hợp Não AI để chưng cất thành các mục kiến thức độc lập
-    const chunks = await distillDocumentWithAi(rawContent, cleanRelPath);
-
-    // Xóa chunks cũ của tài liệu này và nạp mới vào DB
-    db.prepare("DELETE FROM knowledge_chunks WHERE app_id = ? AND doc_id = ?").run(
-      normalizedAppId,
-      docId
-    );
-    db.prepare("DELETE FROM knowledge_chunks WHERE app_id = ? AND relative_path = ?").run(
-      normalizedAppId,
-      cleanRelPath
-    );
-    try {
-      db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ? AND chunk_id LIKE ?").run(
-        normalizedAppId,
-        `${docId}_%`
+    // TRƯỜNG HỢP 1: Tệp hoàn toàn không thay đổi
+    if (existingDoc && existingDoc.content_hash === contentHash) {
+      console.log(
+        `⚡ [KnowledgeRetriever] Document "${cleanRelPath}" is completely UNCHANGED. Skipping AI distillation.`
       );
-    } catch {}
+      diffDetails.push({
+        docName,
+        relativePath: cleanRelPath,
+        retainedChunks: existingDoc.chunk_count || 0,
+        updatedChunks: 0,
+        addedChunks: 0,
+        removedChunks: 0,
+        totalChunks: existingDoc.chunk_count || 0,
+        isUnchanged: true,
+      });
+
+      documentsSaved++;
+      totalChunksSaved += existingDoc.chunk_count || 0;
+      savedSummaries.push({
+        id: docId,
+        appId: normalizedAppId,
+        docName,
+        folderName,
+        relativePath: cleanRelPath,
+        rawSize,
+        chunkCount: existingDoc.chunk_count || 0,
+        updatedAt: now,
+        rawContent,
+      });
+      continue;
+    }
+
+    // TRƯỜNG HỢP 2: Tệp mới hoặc có sửa đổi -> Chạy thuật toán Section Hash Diff
+    const sections = splitDocumentIntoSections(rawContent, cleanRelPath);
+
+    const oldChunks = db
+      .prepare(
+        "SELECT id, doc_id, chunk_index, section_hash, heading, breadcrumb, preview, content FROM knowledge_chunks WHERE app_id = ? AND doc_id = ? ORDER BY chunk_index ASC"
+      )
+      .all(normalizedAppId, docId) as Array<{
+      id: string;
+      doc_id: string;
+      chunk_index: number;
+      section_hash?: string;
+      heading: string;
+      breadcrumb: string;
+      preview: string;
+      content: string;
+    }>;
+
+    const oldChunksBySectionHash = new Map<string, typeof oldChunks>();
+    for (const oc of oldChunks) {
+      if (oc.section_hash) {
+        const list = oldChunksBySectionHash.get(oc.section_hash) || [];
+        list.push(oc);
+        oldChunksBySectionHash.set(oc.section_hash, list);
+      }
+    }
+
+    const hasValidOldHashes = oldChunks.length > 0 && oldChunksBySectionHash.size > 0;
+
+    const retainedChunks: Array<{
+      id: string;
+      sourceName: string;
+      heading: string;
+      breadcrumb: string;
+      preview: string;
+      content: string;
+      sectionHash: string;
+    }> = [];
+
+    let modifiedOrNewSections: DocumentSection[] = [];
+
+    if (hasValidOldHashes) {
+      for (const sec of sections) {
+        if (oldChunksBySectionHash.has(sec.hash)) {
+          // Khối không thay đổi -> Giữ nguyên chunk cũ, 0 tốn token AI
+          const kept = oldChunksBySectionHash.get(sec.hash)!;
+          for (const k of kept) {
+            retainedChunks.push({
+              id: k.id,
+              sourceName: cleanRelPath,
+              heading: k.heading,
+              breadcrumb: k.breadcrumb,
+              preview: k.preview,
+              content: k.content,
+              sectionHash: sec.hash,
+            });
+          }
+        } else {
+          // Khối mới hoặc đã bị sửa đổi
+          modifiedOrNewSections.push(sec);
+        }
+      }
+    } else {
+      // Nạp lần đầu hoặc bản cũ chưa có section_hash
+      modifiedOrNewSections = sections;
+    }
+
+    // Dọn dẹp các chunk cũ không còn được giữ lại
+    const retainedIds = new Set(retainedChunks.map((r) => r.id));
+    const chunksToDelete = oldChunks.filter((oc) => !retainedIds.has(oc.id));
+
+    for (const dc of chunksToDelete) {
+      db.prepare("DELETE FROM knowledge_chunks WHERE id = ?").run(dc.id);
+      try {
+        db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ? AND chunk_id = ?").run(
+          normalizedAppId,
+          dc.id
+        );
+      } catch {}
+    }
+
+    // Phân tích các khối thay đổi / thêm mới bằng AI Distiller
+    const newProcessedChunks: Array<{
+      id?: string;
+      sourceName: string;
+      heading: string;
+      breadcrumb: string;
+      preview: string;
+      content: string;
+      sectionHash: string;
+    }> = [];
+
+    for (const sec of modifiedOrNewSections) {
+      const sectionDistilled = await distillDocumentWithAi(
+        sec.content,
+        `${cleanRelPath} > ${sec.heading}`
+      );
+      for (const d of sectionDistilled) {
+        newProcessedChunks.push({
+          sourceName: cleanRelPath,
+          heading: d.heading || sec.heading,
+          breadcrumb: d.breadcrumb || sec.breadcrumb,
+          preview: d.preview || collapseWhitespace(d.content).slice(0, 200),
+          content: d.content,
+          sectionHash: sec.hash,
+        });
+      }
+    }
+
+    // Hợp nhất danh sách chunks
+    const allFinalChunks = [...retainedChunks, ...newProcessedChunks];
 
     const insertChunk = db.prepare(`
       INSERT INTO knowledge_chunks (
-        id, doc_id, app_id, relative_path, chunk_index, source_name, heading, breadcrumb, preview, content, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, doc_id, app_id, relative_path, chunk_index, source_name, heading, breadcrumb, preview, content, section_hash, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     let insertFts: any = null;
@@ -576,55 +874,63 @@ export async function ingestDocumentsToKnowledgeDb(
       `);
     } catch {}
 
-    for (const c of chunks) {
-      const chunkId = `${docId}_${c.index}`;
-      insertChunk.run(
-        chunkId,
-        docId,
-        normalizedAppId,
-        cleanRelPath,
-        c.index,
-        c.sourceName,
-        c.heading,
-        c.breadcrumb,
-        c.preview,
-        c.content,
-        now
-      );
+    for (let i = 0; i < allFinalChunks.length; i++) {
+      const c = allFinalChunks[i];
+      if (c.id && retainedIds.has(c.id)) {
+        // Cập nhật lại thứ tự index của chunk cũ được giữ lại
+        db.prepare("UPDATE knowledge_chunks SET chunk_index = ?, updated_at = ? WHERE id = ?").run(
+          i,
+          now,
+          c.id
+        );
+      } else {
+        const chunkId = `${docId}_${randomUUID().split("-").join("").slice(0, 12)}_${i}`;
+        c.id = chunkId;
+        insertChunk.run(
+          chunkId,
+          docId,
+          normalizedAppId,
+          cleanRelPath,
+          i,
+          c.sourceName,
+          c.heading,
+          c.breadcrumb,
+          c.preview,
+          c.content,
+          c.sectionHash,
+          now
+        );
 
-      if (insertFts) {
-        try {
-          insertFts.run(
-            chunkId,
-            normalizedAppId,
-            c.heading,
-            c.breadcrumb,
-            c.preview,
-            c.content
-          );
-        } catch {}
-      }
+        if (insertFts) {
+          try {
+            insertFts.run(chunkId, normalizedAppId, c.heading, c.breadcrumb, c.preview, c.content);
+          } catch {}
+        }
 
-      if (insertVec) {
-        try {
-          const rowInfo = db.prepare("SELECT rowid FROM knowledge_chunks WHERE id = ?").get(chunkId) as any;
-          if (rowInfo?.rowid) {
-            const textToEmbed = `${c.heading || ""} ${c.breadcrumb || ""} ${c.content || ""}`;
-            const v = generateSemanticVector(textToEmbed);
-            insertVec.run(BigInt(rowInfo.rowid), v);
-          }
-        } catch {}
+        if (insertVec) {
+          try {
+            const rowInfo = db
+              .prepare("SELECT rowid FROM knowledge_chunks WHERE id = ?")
+              .get(chunkId) as any;
+            if (rowInfo?.rowid) {
+              const textToEmbed = `${c.heading || ""} ${c.breadcrumb || ""} ${c.content || ""}`;
+              const v = generateSemanticVector(textToEmbed);
+              insertVec.run(BigInt(rowInfo.rowid), v);
+            }
+          } catch {}
+        }
       }
     }
 
     db.prepare(
       `
       INSERT INTO knowledge_documents (
-        id, app_id, doc_name, folder_name, relative_path, content_hash, raw_size, chunk_count, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, app_id, doc_name, folder_name, relative_path, raw_content, content_hash, raw_size, chunk_count, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(app_id, relative_path) DO UPDATE SET
         doc_name = excluded.doc_name,
         folder_name = excluded.folder_name,
+        raw_content = excluded.raw_content,
         content_hash = excluded.content_hash,
         raw_size = excluded.raw_size,
         chunk_count = excluded.chunk_count,
@@ -636,14 +942,31 @@ export async function ingestDocumentsToKnowledgeDb(
       docName,
       folderName,
       cleanRelPath,
+      rawContent,
       contentHash,
       rawSize,
-      chunks.length,
+      allFinalChunks.length,
       now
     );
 
+    const diffDetail: KnowledgeDiffDetail = {
+      docName,
+      relativePath: cleanRelPath,
+      retainedChunks: retainedChunks.length,
+      updatedChunks: hasValidOldHashes
+        ? Math.min(modifiedOrNewSections.length, newProcessedChunks.length)
+        : 0,
+      addedChunks: hasValidOldHashes
+        ? Math.max(0, newProcessedChunks.length - modifiedOrNewSections.length)
+        : newProcessedChunks.length,
+      removedChunks: chunksToDelete.length,
+      totalChunks: allFinalChunks.length,
+      isUnchanged: false,
+    };
+    diffDetails.push(diffDetail);
+
     documentsSaved++;
-    totalChunksSaved += chunks.length;
+    totalChunksSaved += allFinalChunks.length;
     savedSummaries.push({
       id: docId,
       appId: normalizedAppId,
@@ -651,15 +974,30 @@ export async function ingestDocumentsToKnowledgeDb(
       folderName,
       relativePath: cleanRelPath,
       rawSize,
-      chunkCount: chunks.length,
+      chunkCount: allFinalChunks.length,
       updatedAt: now,
+      rawContent,
     });
   }
+
+  // Dọn dẹp vector mồ côi nếu có
+  try {
+    const vecDb = getBetterDbWithVec();
+    vecDb
+      .prepare(
+        `
+      DELETE FROM vec_knowledge_chunks
+      WHERE chunk_rowid NOT IN (SELECT rowid FROM knowledge_chunks)
+    `
+      )
+      .run();
+  } catch {}
 
   return {
     documentsSaved,
     totalChunksSaved,
     items: savedSummaries,
+    diffDetails,
   };
 }
 
@@ -682,7 +1020,7 @@ export function listKnowledgeDocumentsFromDb(appId: string): {
     const db = getDbInstance();
     const rows = db
       .prepare(
-        `SELECT id, app_id, doc_name, folder_name, relative_path, raw_size, chunk_count, updated_at
+        `SELECT id, app_id, doc_name, folder_name, relative_path, raw_content, raw_size, chunk_count, updated_at
          FROM knowledge_documents
          WHERE app_id = ?
          ORDER BY folder_name ASC, doc_name ASC`
@@ -693,6 +1031,7 @@ export function listKnowledgeDocumentsFromDb(appId: string): {
       doc_name: string;
       folder_name: string;
       relative_path: string;
+      raw_content?: string;
       raw_size: number;
       chunk_count: number;
       updated_at: string;
@@ -704,6 +1043,7 @@ export function listKnowledgeDocumentsFromDb(appId: string): {
       docName: r.doc_name,
       folderName: r.folder_name || "",
       relativePath: r.relative_path,
+      rawContent: r.raw_content || "",
       rawSize: r.raw_size,
       chunkCount: r.chunk_count,
       updatedAt: r.updated_at,
@@ -786,10 +1126,14 @@ export function deleteKnowledgeFromDb(
 
     try {
       const vecDb = getBetterDbWithVec();
-      vecDb.prepare(`
+      vecDb
+        .prepare(
+          `
         DELETE FROM vec_knowledge_chunks
         WHERE chunk_rowid NOT IN (SELECT rowid FROM knowledge_chunks)
-      `).run();
+      `
+        )
+        .run();
     } catch {}
 
     return Number(res.changes || 0);
@@ -798,10 +1142,14 @@ export function deleteKnowledgeFromDb(
   // Dọn dẹp vector mồ côi nếu có
   try {
     const vecDb = getBetterDbWithVec();
-    vecDb.prepare(`
+    vecDb
+      .prepare(
+        `
       DELETE FROM vec_knowledge_chunks
       WHERE chunk_rowid NOT IN (SELECT rowid FROM knowledge_chunks)
-    `).run();
+    `
+      )
+      .run();
   } catch {}
 
   return 0;
@@ -819,7 +1167,7 @@ export function getKnowledgeDocChunks(appId: string, docId: string): KnowledgeCh
     const db = getDbInstance();
     const rows = db
       .prepare(
-        `SELECT id, doc_id, source_name, heading, breadcrumb, preview, content
+        `SELECT id, doc_id, source_name, heading, breadcrumb, preview, content, section_hash
          FROM knowledge_chunks
          WHERE app_id = ? AND doc_id = ?
          ORDER BY chunk_index ASC`
@@ -832,6 +1180,7 @@ export function getKnowledgeDocChunks(appId: string, docId: string): KnowledgeCh
       breadcrumb: string;
       preview: string;
       content: string;
+      section_hash?: string;
     }>;
 
     return rows.map((r, idx) => ({
@@ -843,11 +1192,98 @@ export function getKnowledgeDocChunks(appId: string, docId: string): KnowledgeCh
       breadcrumb: r.breadcrumb,
       preview: r.preview,
       content: r.content,
+      sectionHash: r.section_hash || "",
     }));
   } catch (err) {
     console.warn("[KnowledgeDB] Failed to get doc chunks:", err);
     return [];
   }
+}
+
+/**
+ * Chỉnh sửa trực tiếp nội dung 1 mục tri thức (Chunk) trong SQLite DB,
+ * đồng thời cập nhật tức thì FTS5 và Vector nhúng ngữ nghĩa (Không dùng Regex).
+ */
+export function updateKnowledgeChunkInDb(
+  appId: string,
+  docId: string,
+  chunkId: string,
+  updates: { heading?: string; content: string; preview?: string }
+): boolean {
+  ensureKnowledgeDbSchema();
+  const normalizedAppId = (appId || "").toLowerCase().trim();
+  if (!normalizedAppId || !docId || !chunkId) return false;
+
+  const db = getDbInstance();
+  const chunk = db
+    .prepare(
+      "SELECT id, doc_id, app_id, relative_path, source_name, heading, breadcrumb, preview, content FROM knowledge_chunks WHERE app_id = ? AND doc_id = ? AND id = ?"
+    )
+    .get(normalizedAppId, docId, chunkId) as
+    | {
+        id: string;
+        doc_id: string;
+        app_id: string;
+        relative_path: string;
+        source_name: string;
+        heading: string;
+        breadcrumb: string;
+        preview: string;
+        content: string;
+      }
+    | undefined;
+
+  if (!chunk) return false;
+
+  const now = new Date().toISOString();
+  const newHeading = (updates.heading || chunk.heading || "Mục kiến thức").trim();
+  const newContent = (updates.content || chunk.content || "").trim();
+  const newPreview = updates.preview || collapseWhitespace(newContent).slice(0, 200);
+
+  // 1. Cập nhật bảng knowledge_chunks
+  db.prepare(
+    `UPDATE knowledge_chunks
+     SET heading = ?, preview = ?, content = ?, updated_at = ?
+     WHERE app_id = ? AND doc_id = ? AND id = ?`
+  ).run(newHeading, newPreview, newContent, now, normalizedAppId, docId, chunkId);
+
+  // 2. Cập nhật bảng FTS5
+  try {
+    db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ? AND chunk_id = ?").run(
+      normalizedAppId,
+      chunkId
+    );
+    db.prepare(
+      `INSERT INTO fts_knowledge_chunks (chunk_id, app_id, heading, breadcrumb, preview, content)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(chunkId, normalizedAppId, newHeading, chunk.breadcrumb, newPreview, newContent);
+  } catch {}
+
+  // 3. Cập nhật bảng Vec
+  try {
+    const rowInfo = db
+      .prepare("SELECT rowid FROM knowledge_chunks WHERE id = ?")
+      .get(chunkId) as any;
+    if (rowInfo?.rowid) {
+      const vecDb = getBetterDbWithVec();
+      const textToEmbed = `${newHeading} ${chunk.breadcrumb} ${newContent}`;
+      const v = generateSemanticVector(textToEmbed);
+      vecDb
+        .prepare(
+          "INSERT OR REPLACE INTO vec_knowledge_chunks (chunk_rowid, embedding) VALUES (?, ?)"
+        )
+        .run(BigInt(rowInfo.rowid), v);
+    }
+  } catch {}
+
+  // 4. Đánh dấu tài liệu cha được cập nhật
+  db.prepare("UPDATE knowledge_documents SET updated_at = ? WHERE app_id = ? AND id = ?").run(
+    now,
+    normalizedAppId,
+    docId
+  );
+
+  return true;
 }
 
 /**
@@ -1060,11 +1496,15 @@ export async function searchKnowledgeBase(
     return { topChunks: [], matchedContent: "", isGreeting: false };
   }
 
-  console.log(`\n📚 [KnowledgeRetriever:searchKnowledgeBase] START | appId: "${normalizedAppId}" | query: "${query}" | totalLoadedChunks: ${allChunks.length} | topK: ${topK}`);
+  console.log(
+    `\n📚 [KnowledgeRetriever:searchKnowledgeBase] START | appId: "${normalizedAppId}" | query: "${query}" | totalLoadedChunks: ${allChunks.length} | topK: ${topK}`
+  );
 
   // Nếu kho kiến thức chỉ có <= topK mục, trả về trực tiếp
   if (allChunks.length <= topK) {
-    console.log(`📚 [KnowledgeRetriever:searchKnowledgeBase] Total chunks (${allChunks.length}) <= topK (${topK}), returning directly.`);
+    console.log(
+      `📚 [KnowledgeRetriever:searchKnowledgeBase] Total chunks (${allChunks.length}) <= topK (${topK}), returning directly.`
+    );
     return {
       topChunks: allChunks,
       matchedContent: allChunks.map((c) => c.content).join("\n\n"),
@@ -1144,7 +1584,9 @@ export async function searchKnowledgeBase(
 
     const rows = vecDb.prepare(hybridSql).all(...params) as any[];
     if (rows && rows.length > 0) {
-      console.log(`   ⚡ [Hybrid RRF] Native query returned ${rows.length} fused candidates (Top RRF score: ${rows[0]?.rrf_score})`);
+      console.log(
+        `   ⚡ [Hybrid RRF] Native query returned ${rows.length} fused candidates (Top RRF score: ${rows[0]?.rrf_score})`
+      );
       candidateChunks = rows.map((r: any) => ({
         id: r.id,
         index: 0,
@@ -1222,7 +1664,9 @@ export async function searchKnowledgeBase(
   // Chấm điểm lại chính xác để chọn ra Top-K mục tinh hoa nhất
   // -------------------------------------------------------------
   try {
-    console.log(`   ⚖️ [CrossEncoderRanker] Evaluating relevance for ${candidateChunks.length} candidate(s)...`);
+    console.log(
+      `   ⚖️ [CrossEncoderRanker] Evaluating relevance for ${candidateChunks.length} candidate(s)...`
+    );
     const candidateCatalog = candidateChunks
       .map((c, i) => `[${i}] ${c.heading} - ${c.preview || c.content.slice(0, 120)}`)
       .join("\n");
@@ -1249,7 +1693,9 @@ Chỉ trả về DUY NHẤT một chuỗi JSON:
     const jsonStr = extractFirstJsonObject(rerankRaw);
     if (jsonStr) {
       const parsed = JSON.parse(jsonStr);
-      console.log(`   ✅ [CrossEncoderRanker] Completed: isGreeting=${parsed?.isGreeting}, selectedIndices=${JSON.stringify(parsed?.selectedIndices)}`);
+      console.log(
+        `   ✅ [CrossEncoderRanker] Completed: isGreeting=${parsed?.isGreeting}, selectedIndices=${JSON.stringify(parsed?.selectedIndices)}`
+      );
       if (parsed?.isGreeting === true) {
         return {
           topChunks: [],

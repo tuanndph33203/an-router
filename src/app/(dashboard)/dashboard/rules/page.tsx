@@ -69,6 +69,16 @@ export default function RulesUnifiedPage() {
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Nạp đè tài liệu cụ thể
+  const [targetDocToOverwrite, setTargetDocToOverwrite] = useState<KnowledgeDocItem | null>(null);
+  const overwriteFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Chỉnh sửa Chunk trực tiếp
+  const [editingChunkId, setEditingChunkId] = useState<string | null>(null);
+  const [editChunkHeading, setEditChunkHeading] = useState("");
+  const [editChunkContent, setEditChunkContent] = useState("");
+  const [isSavingChunk, setIsSavingChunk] = useState(false);
+
   // Popup Cấu hình theo Khóa API
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [activeKey, setActiveKey] = useState<ApiKeyItem | null>(null);
@@ -222,6 +232,125 @@ export default function RulesUnifiedPage() {
       alert(`Không thể nạp tài liệu kéo thả: ${err?.message || err}`);
     } finally {
       setIsUploadingToDb(false);
+    }
+  };
+
+  const handleTriggerDocOverwrite = (doc: KnowledgeDocItem) => {
+    setTargetDocToOverwrite(doc);
+    if (overwriteFileInputRef.current) {
+      overwriteFileInputRef.current.value = "";
+      overwriteFileInputRef.current.click();
+    }
+  };
+
+  const handleExecuteOverwriteUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !targetDocToOverwrite) return;
+
+    const appIdToUse = (
+      selectedAppId ||
+      targetDocToOverwrite.appId ||
+      activeKnowledgeAppId ||
+      "his"
+    )
+      .trim()
+      .toLowerCase();
+
+    setIsUploadingToDb(true);
+    setKnowledgeUploadMsg(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("appId", appIdToUse);
+      formData.append("files", file);
+      formData.append("relativePaths", targetDocToOverwrite.relativePath);
+
+      const res = await fetch("/api/orchestrator/knowledge", {
+        method: "POST",
+        body: formData,
+      });
+
+      const resJson = await res.json();
+      if (!res.ok) {
+        throw new Error(resJson?.Message || `Lỗi ghi đè tài liệu (HTTP ${res.status})`);
+      }
+
+      const data = resJson?.Data;
+      if (data) {
+        setKnowledgeDocs(Array.isArray(data.documents) ? data.documents : []);
+        setKnowledgeFolders(Array.isArray(data.folders) ? data.folders : []);
+        setTotalKnowledgeChunks(Number(data.totalChunks || 0));
+      }
+
+      setKnowledgeUploadMsg(
+        resJson?.Message ||
+          `Đã ghi đè và cập nhật thành công tài liệu "${targetDocToOverwrite.docName}".`
+      );
+    } catch (err: any) {
+      alert(`Không thể ghi đè tài liệu: ${err?.message || err}`);
+    } finally {
+      setIsUploadingToDb(false);
+      setTargetDocToOverwrite(null);
+    }
+  };
+
+  const handleStartEditChunk = (chunk: any) => {
+    setEditingChunkId(chunk.id);
+    setEditChunkHeading(chunk.heading || "");
+    setEditChunkContent(chunk.content || "");
+  };
+
+  const handleCancelEditChunk = () => {
+    setEditingChunkId(null);
+    setEditChunkHeading("");
+    setEditChunkContent("");
+  };
+
+  const handleSaveChunkEdit = async (chunk: any) => {
+    if (!inspectingDoc) return;
+    const appIdToUse = (inspectingDoc.appId || selectedAppId || activeKnowledgeAppId || "his")
+      .trim()
+      .toLowerCase();
+
+    setIsSavingChunk(true);
+    try {
+      const res = await fetch("/api/orchestrator/knowledge", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          appId: appIdToUse,
+          docId: inspectingDoc.id,
+          chunkId: chunk.id,
+          heading: editChunkHeading,
+          content: editChunkContent,
+        }),
+      });
+
+      const resJson = await res.json();
+      if (!res.ok) {
+        throw new Error(resJson?.Message || `Lỗi lưu chunk (HTTP ${res.status})`);
+      }
+
+      // Cập nhật ngay trong inspectingDocChunks
+      setInspectingDocChunks((prev) =>
+        prev.map((c) =>
+          c.id === chunk.id
+            ? {
+                ...c,
+                heading: editChunkHeading,
+                content: editChunkContent,
+                preview: editChunkContent.slice(0, 200),
+              }
+            : c
+        )
+      );
+
+      handleCancelEditChunk();
+      setKnowledgeUploadMsg("Đã cập nhật mục tri thức và chỉ mục vector thành công!");
+    } catch (e: any) {
+      alert(`Không thể lưu mục tri thức: ${e?.message || e}`);
+    } finally {
+      setIsSavingChunk(false);
     }
   };
 
@@ -604,6 +733,14 @@ export default function RulesUnifiedPage() {
           handleUploadFilesOrFolderToDb(e, targetAppForNewDoc || activeKnowledgeAppId)
         }
         multiple
+        accept=".pdf,.docx,.doc,.txt,.md,.markdown,.json,.csv"
+        className="hidden"
+      />
+      {/* Input ẩn để nạp đè / cập nhật 1 tài liệu cụ thể */}
+      <input
+        type="file"
+        ref={overwriteFileInputRef}
+        onChange={handleExecuteOverwriteUpload}
         accept=".pdf,.docx,.doc,.txt,.md,.markdown,.json,.csv"
         className="hidden"
       />
@@ -1173,6 +1310,15 @@ export default function RulesUnifiedPage() {
                             </button>
                             <button
                               type="button"
+                              onClick={() => handleTriggerDocOverwrite(doc)}
+                              disabled={isUploadingToDb}
+                              className="size-7 rounded-lg text-text-muted hover:text-primary hover:bg-primary/10 flex items-center justify-center cursor-pointer transition-colors"
+                              title="Nạp đè / Cập nhật file mới cho tài liệu này"
+                            >
+                              <span className="material-symbols-outlined text-base">sync</span>
+                            </button>
+                            <button
+                              type="button"
                               onClick={() => handleDeleteKnowledgeDoc(selectedAppId, doc.id)}
                               className="size-7 rounded-lg text-text-muted hover:text-red-500 hover:bg-red-500/10 flex items-center justify-center cursor-pointer transition-colors"
                               title="Xóa tài liệu"
@@ -1350,29 +1496,107 @@ export default function RulesUnifiedPage() {
               {inspectingDocChunks.map((chunk, idx) => (
                 <div
                   key={chunk.id || idx}
-                  className="p-4 rounded-xl border border-border bg-surface/70 space-y-2 hover:border-primary/40 transition-colors shadow-2xs"
+                  className="p-4 rounded-xl border border-border bg-surface/70 space-y-3 hover:border-primary/40 transition-colors shadow-2xs"
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <Badge variant="primary" size="sm">
-                        Chunk #{idx + 1}
-                      </Badge>
-                      <h4 className="font-bold text-xs text-text-main">{chunk.heading}</h4>
+                  {editingChunkId === chunk.id ? (
+                    /* CHẾ ĐỘ CHỈNH SỬA TRỰC TIẾP CHUNK */
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-2 border-b border-border pb-2.5">
+                        <div className="flex items-center gap-2">
+                          <Badge variant="primary" size="sm">
+                            Đang sửa Chunk #{idx + 1}
+                          </Badge>
+                          <span className="text-xs font-semibold text-text-main">
+                            Chỉnh sửa quy tắc / công thức
+                          </span>
+                        </div>
+                        <span className="text-[11px] font-mono text-text-muted truncate max-w-[200px]">
+                          {chunk.breadcrumb}
+                        </span>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-[11px] font-semibold text-text-main block">
+                          Tiêu đề mục tri thức *
+                        </label>
+                        <Input
+                          value={editChunkHeading}
+                          onChange={(e) => setEditChunkHeading(e.target.value)}
+                          placeholder="Nhập tiêu đề mục..."
+                          className="text-xs"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-[11px] font-semibold text-text-main block">
+                          Nội dung tri thức chi tiết (Markdown / Text) *
+                        </label>
+                        <Textarea
+                          value={editChunkContent}
+                          onChange={(e) => setEditChunkContent(e.target.value)}
+                          rows={6}
+                          placeholder="Nội dung công thức, quy tắc..."
+                          className="font-mono text-xs leading-relaxed"
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-end gap-2 pt-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={handleCancelEditChunk}
+                          disabled={isSavingChunk}
+                        >
+                          Hủy
+                        </Button>
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          icon="save"
+                          loading={isSavingChunk}
+                          onClick={() => handleSaveChunkEdit(chunk)}
+                          disabled={!editChunkContent.trim()}
+                        >
+                          Lưu mục
+                        </Button>
+                      </div>
                     </div>
-                    <span className="text-[11px] font-mono text-text-muted truncate max-w-[250px]">
-                      {chunk.breadcrumb}
-                    </span>
-                  </div>
+                  ) : (
+                    /* CHẾ ĐỘ XEM CHUNK BÌNH THƯỜNG */
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <Badge variant="primary" size="sm">
+                            Chunk #{idx + 1}
+                          </Badge>
+                          <h4 className="font-bold text-xs text-text-main">{chunk.heading}</h4>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-mono text-text-muted truncate max-w-[220px]">
+                            {chunk.breadcrumb}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleStartEditChunk(chunk)}
+                            className="size-7 rounded-lg text-text-muted hover:text-primary hover:bg-primary/10 flex items-center justify-center cursor-pointer transition-colors"
+                            title="Chỉnh sửa mục tri thức này"
+                          >
+                            <span className="material-symbols-outlined text-base">edit</span>
+                          </button>
+                        </div>
+                      </div>
 
-                  {chunk.preview && (
-                    <p className="text-[11px] text-text-muted italic bg-surface p-2 rounded-lg border border-border/40">
-                      💡 {chunk.preview}
-                    </p>
+                      {chunk.preview && (
+                        <p className="text-[11px] text-text-muted italic bg-surface p-2 rounded-lg border border-border/40">
+                          💡 {chunk.preview}
+                        </p>
+                      )}
+
+                      <pre className="text-xs font-mono p-3 rounded-lg bg-surface/90 border border-border text-text-main whitespace-pre-wrap break-words leading-relaxed">
+                        {chunk.content}
+                      </pre>
+                    </div>
                   )}
-
-                  <pre className="text-xs font-mono p-3 rounded-lg bg-surface/90 border border-border text-text-main whitespace-pre-wrap break-words leading-relaxed">
-                    {chunk.content}
-                  </pre>
                 </div>
               ))}
             </div>
