@@ -62,7 +62,7 @@ export default function RulesUnifiedPage() {
   const [activeKnowledgeAppId, setActiveKnowledgeAppId] = useState<string>("his");
   const [knowledgeDocs, setKnowledgeDocs] = useState<KnowledgeDocItem[]>([]);
   const [knowledgeFolders, setKnowledgeFolders] = useState<string[]>([]);
-  const [totalKnowledgeChunks, setTotalKnowledgeChunks] = useState<number>(0);
+  const [_totalKnowledgeChunks, setTotalKnowledgeChunks] = useState<number>(0);
   const [knowledgeUploadMsg, setKnowledgeUploadMsg] = useState<string | null>(null);
   const [isUploadingToDb, setIsUploadingToDb] = useState(false);
 
@@ -784,18 +784,18 @@ export default function RulesUnifiedPage() {
         }
       >
         <div className="flex flex-col gap-4 w-full">
-          {/* Thanh chuyển Tab dùng SegmentedControl chung */}
+          {/* Thanh chuyển Tab & Toolbar thao tác gộp gọn gàng trên 1 hàng duy nhất */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-border">
             <SegmentedControl
               options={[
                 {
                   value: "knowledge_db",
-                  label: `Kho Tri Thức (${knowledgeDocs.length} tệp • ${totalKnowledgeChunks} mục)`,
+                  label: "Kho Tri Thức",
                   icon: "menu_book",
                 },
                 {
                   value: "playbook",
-                  label: "Rule Cứng (Playbook)",
+                  label: "Rule Cứng",
                   icon: "gavel",
                 },
               ]}
@@ -804,86 +804,76 @@ export default function RulesUnifiedPage() {
               size="sm"
             />
 
-            {/* Quick status on the right */}
-            <div className="text-xs text-text-muted flex items-center gap-2">
-              <span>Ứng dụng:</span>
-              <span className="font-mono font-bold uppercase text-text-main">{selectedAppId}</span>
-            </div>
+            {activeTab === "knowledge_db" && knowledgeDocs.length > 0 ? (
+              <div className="flex items-center gap-1.5 shrink-0">
+                <Button
+                  variant={showSearchSandbox ? "primary" : "secondary"}
+                  size="sm"
+                  icon="search"
+                  onClick={() => setShowSearchSandbox(!showSearchSandbox)}
+                >
+                  Tìm thử
+                </Button>
+
+                <Button
+                  variant="primary"
+                  size="sm"
+                  icon="upload_file"
+                  onClick={() => {
+                    setTargetAppForNewDoc(selectedAppId);
+                    fileInputRef.current?.click();
+                  }}
+                  disabled={isUploadingToDb}
+                >
+                  Chọn File
+                </Button>
+
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon="folder_open"
+                  onClick={() => {
+                    setTargetAppForNewDoc(selectedAppId);
+                    folderInputRef.current?.click();
+                  }}
+                  disabled={isUploadingToDb}
+                >
+                  Chọn Folder
+                </Button>
+
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon="edit_note"
+                  onClick={() => {
+                    setTargetAppForNewDoc(selectedAppId);
+                    setShowAddRuleModal(true);
+                  }}
+                >
+                  Nhập tay
+                </Button>
+
+                <Button
+                  variant="danger"
+                  size="sm"
+                  icon="delete_sweep"
+                  onClick={handleClearAllKnowledge}
+                  title="Xóa toàn bộ tài liệu"
+                />
+              </div>
+            ) : (
+              <div className="text-xs text-text-muted flex items-center gap-2">
+                <span>Ứng dụng:</span>
+                <span className="font-mono font-bold uppercase text-text-main">
+                  {selectedAppId}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* TAB 1: KHO TRI THỨC NGHIỆP VỤ */}
           {activeTab === "knowledge_db" && (
             <div className="space-y-4">
-              {/* Toolbar thao tác khi đã có tài liệu trong DB */}
-              {knowledgeDocs.length > 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2.5 p-3 rounded-xl bg-surface/60 border border-border">
-                  <div className="flex items-center gap-2 text-xs text-text-muted">
-                    <span className="material-symbols-outlined text-base text-primary">folder</span>
-                    <span>
-                      Đang quản lý <strong>{knowledgeDocs.length}</strong> tài liệu (
-                      <strong>{totalKnowledgeChunks}</strong> mục tri thức vector)
-                    </span>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      variant={showSearchSandbox ? "primary" : "secondary"}
-                      size="sm"
-                      icon="search"
-                      onClick={() => setShowSearchSandbox(!showSearchSandbox)}
-                    >
-                      Tìm thử
-                    </Button>
-
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      icon="upload_file"
-                      onClick={() => {
-                        setTargetAppForNewDoc(selectedAppId);
-                        fileInputRef.current?.click();
-                      }}
-                      disabled={isUploadingToDb}
-                    >
-                      Chọn File
-                    </Button>
-
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      icon="folder_open"
-                      onClick={() => {
-                        setTargetAppForNewDoc(selectedAppId);
-                        folderInputRef.current?.click();
-                      }}
-                      disabled={isUploadingToDb}
-                    >
-                      Chọn Folder
-                    </Button>
-
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      icon="edit_note"
-                      onClick={() => {
-                        setTargetAppForNewDoc(selectedAppId);
-                        setShowAddRuleModal(true);
-                      }}
-                    >
-                      Nhập tay
-                    </Button>
-
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      icon="delete_sweep"
-                      onClick={handleClearAllKnowledge}
-                      title="Xóa toàn bộ tài liệu"
-                    />
-                  </div>
-                </div>
-              )}
-
               {/* Thông báo kết quả nạp */}
               {knowledgeUploadMsg && (
                 <div className="px-3.5 py-2.5 rounded-xl bg-green-500/10 border border-green-500/30 text-green-700 dark:text-green-300 text-xs flex items-center justify-between">
