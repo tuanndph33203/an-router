@@ -516,7 +516,7 @@ export default function RulesUnifiedPage() {
           handleUploadFilesOrFolderToDb(e, targetAppForNewDoc || activeKnowledgeAppId)
         }
         multiple
-        accept=".md,.markdown,.txt,.json,.csv"
+        accept=".pdf,.docx,.doc,.txt,.md,.markdown,.json,.csv"
         className="hidden"
       />
 

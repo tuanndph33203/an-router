@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "crypto";
 import { getDbInstance } from "@/lib/db/core";
+import { callInternalLlm } from "./planEngine";
 
 export interface KnowledgeChunk {
   index: number;
@@ -228,17 +229,188 @@ export function chunkMarkdownByHeadings(
 }
 
 /**
+ * Trích xuất mảng JSON đầu tiên trong chuỗi phản hồi của LLM (Không dùng Regex).
+ */
+function extractFirstJsonArray(rawText: string): string | null {
+  if (!rawText) return null;
+  const startIdx = rawText.indexOf("[");
+  if (startIdx === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = startIdx; i < rawText.length; i++) {
+    const ch = rawText[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "[") depth++;
+      else if (ch === "]") {
+        depth--;
+        if (depth === 0) {
+          return rawText.slice(startIdx, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Băm tài liệu theo đoạn văn / bảng biểu khi văn bản không có tiêu đề Markdown (Không dùng Regex).
+ */
+function chunkDocumentByParagraphs(
+  rawText: string,
+  sourceName: string,
+  maxWordsPerChunk: number = 400
+): KnowledgeChunk[] {
+  if (!rawText || !rawText.trim()) return [];
+  const lines = rawText.split("\n");
+  const chunks: KnowledgeChunk[] = [];
+  let currentLines: string[] = [];
+  let wordCount = 0;
+
+  const flush = () => {
+    const body = currentLines.join("\n").trim();
+    currentLines = [];
+    wordCount = 0;
+    if (!body || body.length < 15) return;
+
+    const preview = collapseWhitespace(body).slice(0, 200);
+    const idx = chunks.length;
+    const heading = `Mục kiến thức ${idx + 1} (${sourceName})`;
+    const breadcrumb = `[Nguồn: ${sourceName} > Mục ${idx + 1}]`;
+
+    chunks.push({
+      index: idx,
+      id: `chunk_${idx}`,
+      sourceName,
+      heading,
+      breadcrumb,
+      preview,
+      content: `${breadcrumb}\n${body}`,
+    });
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (wordCount >= maxWordsPerChunk) flush();
+      continue;
+    }
+    const wordsInLine = line.split(" ").filter(Boolean).length;
+    currentLines.push(line);
+    wordCount += wordsInLine;
+
+    if (wordCount >= maxWordsPerChunk) {
+      flush();
+    }
+  }
+
+  flush();
+  return chunks;
+}
+
+/**
+ * TÍCH HỢP NÃO AI ĐỂ CHƯNG CẤT TRI THỨC (AI Knowledge Distiller):
+ * Đọc file phức tạp (PDF bảng biểu, Word testcase, tài liệu không cấu trúc) và
+ * tự động trích xuất các quy tắc, điều kiện và công thức tính toán thành các mục sạch sẽ.
+ */
+export async function distillDocumentWithAi(
+  rawContent: string,
+  sourceName: string
+): Promise<KnowledgeChunk[]> {
+  if (!rawContent || !rawContent.trim()) return [];
+
+  // Nếu tài liệu có cấu trúc Markdown rõ ràng và ngắn (< 5000 ký tự), dùng băm heading thuần túy
+  const hasMarkdownHeadings =
+    rawContent.includes("# ") || rawContent.includes("## ") || rawContent.includes("### ");
+  if (hasMarkdownHeadings && rawContent.length < 5000) {
+    return chunkMarkdownByHeadings(rawContent, sourceName);
+  }
+
+  // Gọi Bộ Não AI (Gemini Flash) để chưng cất tri thức
+  try {
+    const prompt = `Bạn là Chuyên gia Chưng cất Tri thức Nghiệp vụ (Enterprise Knowledge Distiller).
+Nhiệm vụ của bạn là đọc kỹ tài liệu dưới đây và trích xuất thành danh sách các MỤC KIẾN THỨC NGHIỆP VỤ ĐỘC LẬP để nạp vào Database tra cứu tự động cho AI điều phối báo cáo & API.
+
+TÀI LIỆU CẦN CHƯNG CẤT (Nguồn: ${sourceName}):
+"""
+${rawContent.slice(0, 25000)}
+"""
+
+YÊU CẦU BẮT BUỘC:
+1. Trích xuất tất cả:
+   - CÁC CÔNG THỨC TÍNH TOÁN / TÀI CHÍNH (ví dụ: totalPayment, totalAmount, chiết khấu, thuế, cách tính doanh thu...).
+   - CÁC QUY TẮC NGHIỆP VỤ (Điều kiện xuất hóa đơn, áp dụng CTKM, trạng thái hợp lệ, logic trừ hủy...).
+   - ÁNH XẠ BẢNG / TRƯỜNG CƠ SỞ DỮ LIỆU (nếu có đề cập).
+2. Tách nhỏ thành từng mục riêng biệt theo từng chức năng / phân hệ.
+3. Bỏ qua các thông tin rác (link screenshot, id testcase thừa, nhật ký bug không liên quan đến logic).
+4. Mỗi mục gồm:
+   - "heading": Tiêu đề ngắn gọn phản ánh đúng quy tắc (ví dụ: "Công thức tính Doanh thu Thẻ NoName")
+   - "breadcrumb": Ngữ cảnh phân cấp đầy đủ (ví dụ: "[Nguồn: ${sourceName} > Phân hệ Bán Thẻ > Công thức]")
+   - "preview": Tóm tắt 1-2 câu nội dung cốt lõi của mục
+   - "content": Toàn bộ nội dung quy tắc hoặc công thức chi tiết, rõ ràng
+
+Định dạng trả về: DUY NHẤT một mảng JSON chuẩn:
+[
+  {
+    "heading": "Tiêu đề mục",
+    "breadcrumb": "[Nguồn: ...]",
+    "preview": "Tóm tắt...",
+    "content": "Nội dung quy tắc chi tiết..."
+  }
+]`;
+
+    const llmRaw = await callInternalLlm([{ role: "user", content: prompt }]);
+    const jsonStr = extractFirstJsonArray(llmRaw);
+    if (jsonStr) {
+      const parsed = JSON.parse(jsonStr);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.map((item: any, idx: number) => ({
+          index: idx,
+          id: `chunk_${idx}`,
+          sourceName,
+          heading: String(item.heading || `Quy tắc ${idx + 1}`).trim(),
+          breadcrumb: String(item.breadcrumb || `[Nguồn: ${sourceName}]`).trim(),
+          preview: String(item.preview || "").trim(),
+          content: String(item.content || "").trim(),
+        }));
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[KnowledgeDB] AI Distiller fallback for ${sourceName}:`, err?.message || err);
+  }
+
+  // Fallback an toàn: nếu AI không phản hồi, băm theo cấu trúc heading hoặc đoạn văn
+  const headingChunks = chunkMarkdownByHeadings(rawContent, sourceName);
+  if (headingChunks.length > 0) return headingChunks;
+  return chunkDocumentByParagraphs(rawContent, sourceName);
+}
+
+/**
  * Nạp (Ingest) danh sách tài liệu từ Folder hoặc File trực tiếp vào SQLite DB (`knowledge_documents` & `knowledge_chunks`).
  * Không tạo file vật lý trong thư mục `rules/`.
  */
-export function ingestDocumentsToKnowledgeDb(
+export async function ingestDocumentsToKnowledgeDb(
   appId: string,
   documents: Array<{ relativePath: string; content: string }>
-): {
+): Promise<{
   documentsSaved: number;
   totalChunksSaved: number;
   items: KnowledgeDocumentSummary[];
-} {
+}> {
   ensureKnowledgeDbSchema();
   const normalizedAppId = (appId || "").toLowerCase().trim();
   if (!normalizedAppId) {
@@ -278,7 +450,9 @@ export function ingestDocumentsToKnowledgeDb(
       .get(normalizedAppId, cleanRelPath) as { id: string; content_hash: string } | undefined;
 
     const docId = existingDoc?.id || `kdoc_${randomUUID().split("-").join("").slice(0, 16)}`;
-    const chunks = chunkMarkdownByHeadings(rawContent, cleanRelPath);
+
+    // Tích hợp Não AI để chưng cất thành các mục kiến thức độc lập
+    const chunks = await distillDocumentWithAi(rawContent, cleanRelPath);
 
     // Xóa chunks cũ của tài liệu này và nạp mới vào DB
     db.prepare("DELETE FROM knowledge_chunks WHERE app_id = ? AND doc_id = ?").run(

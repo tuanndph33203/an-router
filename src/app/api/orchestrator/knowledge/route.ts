@@ -4,6 +4,7 @@ import {
   listKnowledgeDocumentsFromDb,
   deleteKnowledgeFromDb,
 } from "@/lib/orchestrator/knowledgeRetriever";
+import { extractTextFromDocumentBuffer } from "@/lib/orchestrator/documentExtractor";
 
 export const dynamic = "force-dynamic";
 
@@ -89,20 +90,26 @@ export async function POST(request: Request) {
         const file = files[i];
         const relPath = (relativePaths[i] || file.name || `doc_${i + 1}.md`).trim();
         const lowerName = relPath.toLowerCase();
-        const isSupportedText =
+        const isSupportedFormat =
           lowerName.endsWith(".md") ||
           lowerName.endsWith(".markdown") ||
           lowerName.endsWith(".txt") ||
           lowerName.endsWith(".json") ||
-          lowerName.endsWith(".csv");
-        if (!isSupportedText) continue;
+          lowerName.endsWith(".csv") ||
+          lowerName.endsWith(".pdf") ||
+          lowerName.endsWith(".docx") ||
+          lowerName.endsWith(".doc");
 
-        const textContent = await file.text();
-        if (!textContent.trim()) continue;
+        if (!isSupportedFormat) continue;
+
+        const arrayBuffer = await file.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        const extracted = await extractTextFromDocumentBuffer(buffer, relPath);
+        if (!extracted.text.trim()) continue;
 
         docsToIngest.push({
           relativePath: relPath,
-          content: textContent,
+          content: extracted.text,
           folderName: customFolderName || undefined,
         });
       }
@@ -147,7 +154,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const ingestResult = ingestDocumentsToKnowledgeDb(appId, docsToIngest);
+    const ingestResult = await ingestDocumentsToKnowledgeDb(appId, docsToIngest);
     const updatedList = listKnowledgeDocumentsFromDb(appId);
 
     return NextResponse.json(

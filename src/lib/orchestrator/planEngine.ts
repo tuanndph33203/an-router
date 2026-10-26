@@ -561,7 +561,7 @@ async function callInternalLlmStream(
   }
 }
 
-async function callInternalLlm(
+export async function callInternalLlm(
   messages: Array<{ role: string; content: string }>,
   model: string = DEFAULT_INTERNAL_MODEL
 ): Promise<string> {

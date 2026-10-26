@@ -1050,7 +1050,7 @@ export function AppConfigModal({
                     ref={knowledgeFileInputRef}
                     onChange={handleKnowledgeDbUpload}
                     multiple
-                    accept=".md,.markdown,.txt,.json,.csv"
+                    accept=".pdf,.docx,.doc,.txt,.md,.markdown,.json,.csv"
                     className="hidden"
                   />
                   <Button
