@@ -79,6 +79,16 @@ export function ensureKnowledgeDbSchema(): void {
 
       CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_app
         ON knowledge_chunks(app_id, doc_id, chunk_index);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_knowledge_chunks USING fts5(
+        chunk_id UNINDEXED,
+        app_id UNINDEXED,
+        heading,
+        breadcrumb,
+        preview,
+        content,
+        tokenize = 'unicode61'
+      );
     `);
     isSchemaEnsured = true;
   } catch (err) {
@@ -463,6 +473,12 @@ export async function ingestDocumentsToKnowledgeDb(
       normalizedAppId,
       cleanRelPath
     );
+    try {
+      db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ? AND chunk_id LIKE ?").run(
+        normalizedAppId,
+        `${docId}_%`
+      );
+    } catch {}
 
     const insertChunk = db.prepare(`
       INSERT INTO knowledge_chunks (
@@ -470,9 +486,19 @@ export async function ingestDocumentsToKnowledgeDb(
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    let insertFts: any = null;
+    try {
+      insertFts = db.prepare(`
+        INSERT INTO fts_knowledge_chunks (
+          chunk_id, app_id, heading, breadcrumb, preview, content
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+    } catch {}
+
     for (const c of chunks) {
+      const chunkId = `${docId}_${c.index}`;
       insertChunk.run(
-        `${docId}_${c.index}`,
+        chunkId,
         docId,
         normalizedAppId,
         cleanRelPath,
@@ -484,6 +510,19 @@ export async function ingestDocumentsToKnowledgeDb(
         c.content,
         now
       );
+
+      if (insertFts) {
+        try {
+          insertFts.run(
+            chunkId,
+            normalizedAppId,
+            c.heading,
+            c.breadcrumb,
+            c.preview,
+            c.content
+          );
+        } catch {}
+      }
     }
 
     db.prepare(
@@ -609,6 +648,9 @@ export function deleteKnowledgeFromDb(
   const db = getDbInstance();
   if (options?.clearAll) {
     db.prepare("DELETE FROM knowledge_chunks WHERE app_id = ?").run(normalizedAppId);
+    try {
+      db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ?").run(normalizedAppId);
+    } catch {}
     const res = db.prepare("DELETE FROM knowledge_documents WHERE app_id = ?").run(normalizedAppId);
     return Number(res.changes || 0);
   }
@@ -618,6 +660,12 @@ export function deleteKnowledgeFromDb(
       normalizedAppId,
       options.docId
     );
+    try {
+      db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ? AND chunk_id LIKE ?").run(
+        normalizedAppId,
+        `${options.docId}_%`
+      );
+    } catch {}
     const res = db
       .prepare("DELETE FROM knowledge_documents WHERE app_id = ? AND id = ?")
       .run(normalizedAppId, options.docId);
@@ -633,6 +681,12 @@ export function deleteKnowledgeFromDb(
         normalizedAppId,
         d.id
       );
+      try {
+        db.prepare("DELETE FROM fts_knowledge_chunks WHERE app_id = ? AND chunk_id LIKE ?").run(
+          normalizedAppId,
+          `${d.id}_%`
+        );
+      } catch {}
     }
     const res = db
       .prepare("DELETE FROM knowledge_documents WHERE app_id = ? AND folder_name = ?")
@@ -720,5 +774,299 @@ export function assembleSelectedRuleChunks(
   return {
     matchedContent: effectiveChunks.map((c) => c.content).join("\n\n"),
     selectedChunks: effectiveChunks,
+  };
+}
+
+/**
+ * Trích xuất chuỗi JSON object đầu tiên (Không dùng Regex).
+ */
+function extractFirstJsonObject(rawText: string): string | null {
+  if (!rawText) return null;
+  const startIdx = rawText.indexOf("{");
+  if (startIdx === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = startIdx; i < rawText.length; i++) {
+    const ch = rawText[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          return rawText.slice(startIdx, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Trích xuất các từ khóa an toàn cho câu truy vấn FTS5 (Không dùng Regex).
+ */
+function sanitizeQueryForFts5(query: string): string {
+  if (!query) return "";
+  const words: string[] = [];
+  const rawParts = query.split(" ");
+  for (const part of rawParts) {
+    let clean = "";
+    for (let i = 0; i < part.length; i++) {
+      const code = part.charCodeAt(i);
+      const isAlphanumeric =
+        (code >= 48 && code <= 57) ||
+        (code >= 65 && code <= 90) ||
+        (code >= 97 && code <= 122) ||
+        code >= 192;
+      if (isAlphanumeric) {
+        clean += part[i];
+      }
+    }
+    if (clean.length >= 2) {
+      words.push(`"${clean}"`);
+    }
+  }
+  return words.join(" OR ");
+}
+
+/**
+ * Tách các từ đơn phục vụ Semantic / Token Overlap (Không dùng Regex).
+ */
+function extractSearchTokens(text: string): string[] {
+  if (!text) return [];
+  const tokens: string[] = [];
+  const parts = text.toLowerCase().split(" ");
+  for (const part of parts) {
+    let clean = "";
+    for (let i = 0; i < part.length; i++) {
+      const code = part.charCodeAt(i);
+      const isAlphanumeric =
+        (code >= 48 && code <= 57) ||
+        (code >= 65 && code <= 90) ||
+        (code >= 97 && code <= 122) ||
+        code >= 192;
+      if (isAlphanumeric) {
+        clean += part[i];
+      }
+    }
+    if (clean.length >= 2) {
+      tokens.push(clean);
+    }
+  }
+  return tokens;
+}
+
+export interface SearchKnowledgeOptions {
+  topK?: number;
+  useReranker?: boolean;
+}
+
+export interface KnowledgeSearchResult {
+  topChunks: KnowledgeChunk[];
+  matchedContent: string;
+  isGreeting: boolean;
+  greetingReply?: string;
+}
+
+/**
+ * BỘ HÀM MULTI-SEARCH KIẾN THỨC + RERANKER (Advanced RAG):
+ * 1. Nhánh 1: FTS5 Full-Text Search (Sparse Search) - Tìm chính xác từ khóa, mã code, tên bảng.
+ * 2. Nhánh 2: Semantic / Token Matching (Dense Search) - Tính điểm xuất hiện theo ngữ cảnh.
+ * 3. Fusion: Gom kết quả bằng thuật toán RRF (Reciprocal Rank Fusion).
+ * 4. Reranker: Chấm điểm lại mức độ phù hợp để chọn ra Top-K mục tinh hoa nhất.
+ */
+export async function searchKnowledgeBase(
+  appId: string,
+  query: string,
+  options?: SearchKnowledgeOptions
+): Promise<KnowledgeSearchResult> {
+  ensureKnowledgeDbSchema();
+  const normalizedAppId = (appId || "").toLowerCase().trim();
+  const topK = options?.topK || 3;
+
+  if (!normalizedAppId || !query || !query.trim()) {
+    return { topChunks: [], matchedContent: "", isGreeting: false };
+  }
+
+  const allChunks = loadKnowledgeChunksFromDb(normalizedAppId);
+  if (allChunks.length === 0) {
+    return { topChunks: [], matchedContent: "", isGreeting: false };
+  }
+
+  // Nếu kho kiến thức chỉ có <= topK mục, trả về trực tiếp
+  if (allChunks.length <= topK) {
+    return {
+      topChunks: allChunks,
+      matchedContent: allChunks.map((c) => c.content).join("\n\n"),
+      isGreeting: false,
+    };
+  }
+
+  const db = getDbInstance();
+  const chunkMap = new Map<string, KnowledgeChunk>();
+  allChunks.forEach((c) => chunkMap.set(c.id, c));
+
+  // -------------------------------------------------------------
+  // NHÁNH 1: FTS5 Full-Text Search (Sparse Search)
+  // -------------------------------------------------------------
+  const ftsRanks = new Map<string, number>();
+  const ftsMatchQuery = sanitizeQueryForFts5(query);
+
+  if (ftsMatchQuery) {
+    try {
+      const rows = db
+        .prepare(
+          `SELECT chunk_id, rank
+           FROM fts_knowledge_chunks
+           WHERE app_id = ? AND fts_knowledge_chunks MATCH ?
+           ORDER BY rank ASC
+           LIMIT 12`
+        )
+        .all(normalizedAppId, ftsMatchQuery) as Array<{ chunk_id: string; rank: number }>;
+
+      rows.forEach((r, idx) => {
+        ftsRanks.set(r.chunk_id, idx + 1);
+      });
+    } catch {}
+  }
+
+  // -------------------------------------------------------------
+  // NHÁNH 2: Semantic Token / Concept Overlap (Dense Search)
+  // -------------------------------------------------------------
+  const queryTokens = extractSearchTokens(query);
+  const semanticScores: Array<{ chunkId: string; score: number }> = [];
+
+  for (const c of allChunks) {
+    let score = 0;
+    const headingLower = c.heading.toLowerCase();
+    const breadcrumbLower = c.breadcrumb.toLowerCase();
+    const previewLower = c.preview.toLowerCase();
+    const contentLower = c.content.toLowerCase();
+
+    for (const t of queryTokens) {
+      if (headingLower.includes(t)) score += 5;
+      if (breadcrumbLower.includes(t)) score += 3;
+      if (previewLower.includes(t)) score += 2;
+      if (contentLower.includes(t)) score += 1;
+    }
+
+    if (score > 0) {
+      semanticScores.push({ chunkId: c.id, score });
+    }
+  }
+
+  semanticScores.sort((a, b) => b.score - a.score);
+  const semanticRanks = new Map<string, number>();
+  semanticScores.slice(0, 12).forEach((s, idx) => {
+    semanticRanks.set(s.chunkId, idx + 1);
+  });
+
+  // -------------------------------------------------------------
+  // FUSION: Reciprocal Rank Fusion (RRF)
+  // -------------------------------------------------------------
+  const RRF_K = 60;
+  const candidateIds = new Set<string>([...ftsRanks.keys(), ...semanticRanks.keys()]);
+  const fusedScores: Array<{ chunk: KnowledgeChunk; rrfScore: number }> = [];
+
+  for (const id of candidateIds) {
+    const chunk = chunkMap.get(id);
+    if (!chunk) continue;
+
+    const fRank = ftsRanks.get(id);
+    const sRank = semanticRanks.get(id);
+
+    const ftsContrib = fRank ? 1.0 / (RRF_K + fRank) : 0;
+    const semContrib = sRank ? 1.0 / (RRF_K + sRank) : 0;
+    const rrfScore = ftsContrib + semContrib;
+
+    fusedScores.push({ chunk, rrfScore });
+  }
+
+  fusedScores.sort((a, b) => b.rrfScore - a.rrfScore);
+
+  // Lấy danh sách Top ứng viên để đưa qua Reranker (tối đa 6 mục)
+  let candidateChunks = fusedScores.slice(0, 6).map((f) => f.chunk);
+  if (candidateChunks.length === 0) {
+    candidateChunks = allChunks.slice(0, 6);
+  }
+
+  // -------------------------------------------------------------
+  // NHÁNH 3: BỘ RERANKER (Relevance Cross-Encoder)
+  // Chấm điểm lại chính xác để chọn ra Top-K mục tinh hoa nhất
+  // -------------------------------------------------------------
+  try {
+    const candidateCatalog = candidateChunks
+      .map((c, i) => `[${i}] ${c.heading} - ${c.preview || c.content.slice(0, 120)}`)
+      .join("\n");
+
+    const rerankPrompt = `Bạn là Bộ Reranker Tri thức Nghiệp vụ (Relevance Cross-Encoder).
+Câu hỏi của người dùng: "${query}"
+
+Danh sách các mục kiến thức ứng viên (${candidateChunks.length} mục):
+${candidateCatalog}
+
+Nhiệm vụ:
+1. Nếu câu hỏi CHỈ LÀ câu chào hỏi xã giao, cảm ơn, hỏi bạn là ai (không cần tra cứu nghiệp vụ/số liệu):
+   - Đặt "isGreeting": true
+   - Đặt "greetingReply": Câu trả lời chào hỏi ngắn gọn, lịch sự bằng tiếng Việt
+   - Đặt "selectedIndices": []
+2. Nếu câu hỏi cần tra cứu nghiệp vụ, số liệu, quy tắc:
+   - Đặt "isGreeting": false
+   - Đặt "selectedIndices": Mảng index (tối đa ${topK} mục) liên quan nhất, xếp theo thứ tự ưu tiên giảm dần.
+
+Chỉ trả về DUY NHẤT một chuỗi JSON:
+{"isGreeting": false, "selectedIndices": [0, 1], "greetingReply": ""}`;
+
+    const rerankRaw = await callInternalLlm([{ role: "user", content: rerankPrompt }]);
+    const jsonStr = extractFirstJsonObject(rerankRaw);
+    if (jsonStr) {
+      const parsed = JSON.parse(jsonStr);
+      if (parsed?.isGreeting === true) {
+        return {
+          topChunks: [],
+          matchedContent: "",
+          isGreeting: true,
+          greetingReply:
+            (typeof parsed.greetingReply === "string" && parsed.greetingReply.trim()) ||
+            "Xin chào! Tôi có thể giúp gì cho bạn?",
+        };
+      }
+
+      if (Array.isArray(parsed?.selectedIndices) && parsed.selectedIndices.length > 0) {
+        const topIndices = parsed.selectedIndices.filter(
+          (i: any) => typeof i === "number" && i >= 0 && i < candidateChunks.length
+        );
+        const top = topIndices.map((i: number) => candidateChunks[i]);
+        return {
+          topChunks: top,
+          matchedContent: top.map((c) => c.content).join("\n\n"),
+          isGreeting: false,
+        };
+      }
+    }
+  } catch (err: any) {
+    console.warn("[KnowledgeDB] Reranker fallback:", err?.message || err);
+  }
+
+  // Fallback nếu Reranker gặp lỗi: lấy theo RRF topK
+  const fallbackTop = candidateChunks.slice(0, topK);
+  return {
+    topChunks: fallbackTop,
+    matchedContent: fallbackTop.map((c) => c.content).join("\n\n"),
+    isGreeting: false,
   };
 }

@@ -13,6 +13,7 @@ import {
   loadKnowledgeChunksFromDb,
   buildRuleBookCatalogForLocator,
   assembleSelectedRuleChunks,
+  searchKnowledgeBase,
 } from "./knowledgeRetriever";
 
 export interface PlanOutput {
@@ -29,6 +30,13 @@ export interface PlanOutput {
 
 const DEFAULT_INTERNAL_MODEL = process.env.INTERNAL_AGENT_MODEL || "gemini-3.8-flash-tiered";
 
+interface SchemaCacheEntry {
+  data: any;
+  timestamp: number;
+}
+const schemaCache = new Map<string, SchemaCacheEntry>();
+const SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 phút
+
 async function fetchSchemaFromBackend(
   schemaUrl: string,
   appId: string,
@@ -36,6 +44,13 @@ async function fetchSchemaFromBackend(
   tables: string[] | undefined,
   userAuthToken: string = ""
 ): Promise<any> {
+  const sortedTablesKey = tables ? [...tables].sort().join(",") : "*";
+  const cacheKey = `${schemaUrl}:${appId}:${mode}:${sortedTablesKey}`;
+  const cached = schemaCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < SCHEMA_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   if (!schemaUrl || !isSubscriptionFetchUrlAllowed(schemaUrl, { allowLocal: true })) {
     throw new Error(`URL schema không hợp lệ hoặc bị chặn: ${schemaUrl}`);
   }
@@ -81,7 +96,67 @@ async function fetchSchemaFromBackend(
   if (!data) {
     throw new Error(`Dữ liệu schema trả về từ ${schemaUrl} không đúng định dạng JSON.`);
   }
+  schemaCache.set(cacheKey, { data, timestamp: Date.now() });
   return data;
+}
+
+export async function callInternalLlmWithTools(
+  messages: Array<any>,
+  tools: any[],
+  toolChoice?: any,
+  model: string = DEFAULT_INTERNAL_MODEL
+): Promise<{
+  content: string | null;
+  toolCalls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+}> {
+  try {
+    const bearer = resolveSelfLoopBearer();
+    const headers = new Headers({
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${bearer}`,
+    });
+
+    const bodyObj: any = {
+      model,
+      messages,
+      stream: false,
+      temperature: 0.1,
+      reasoning_effort: "low",
+    };
+    if (tools && tools.length > 0) {
+      bodyObj.tools = tools;
+    }
+    if (toolChoice) {
+      bodyObj.tool_choice = toolChoice;
+    }
+
+    const req = new Request("http://localhost/api/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(bodyObj),
+    });
+
+    const res = await postChatCompletion(req);
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn("[PlanEngine] Internal LLM with tools failed:", res.status, errText);
+      return { content: null };
+    }
+
+    const json = await res.json();
+    const choice = json.choices?.[0]?.message;
+    return {
+      content: choice?.content || null,
+      toolCalls: choice?.tool_calls || undefined,
+    };
+  } catch (err: any) {
+    console.error("[PlanEngine] Error in callInternalLlmWithTools:", err?.message || err);
+    return { content: null };
+  }
 }
 
 export async function generateActionPlan(
@@ -92,338 +167,421 @@ export async function generateActionPlan(
   userAuthToken: string = "",
   onProgressStatus?: (msg: string) => void
 ): Promise<PlanOutput> {
-  let apiDetailedPromptSection = "";
-  let opsListStr = "Không có OpenAPI schema khả dụng.";
-  let selectedApiOpsCount = 0;
-
-  // =========================================================================
-  // BƯỚC 1: ĐỊNH VỊ ENDPOINT REST API (OpenAPI Summary Locator)
-  // =========================================================================
-  if (appConfig.swaggerEndpointUrl) {
-    const swaggerOps = await getSwaggerOperations(appConfig.swaggerEndpointUrl, true);
-    if (swaggerOps.length > 0) {
-      onProgressStatus?.("Đang kiểm tra danh mục API liên quan...");
-      const apiSummaryList = swaggerOps
-        .map(
-          (op, idx) =>
-            `[${idx}] [${op.action}] ${op.endpoint} - ${op.summary || op.description || op.operationId}`
-        )
-        .join("\n");
-
-      const apiLocatorPrompt = `Bạn là bộ định vị API (OpenAPI Locator) cho ứng dụng ${appConfig.name}.
-Yêu cầu của người dùng: "${instruction}"
-Danh sách các API hiện có trong hệ thống (${swaggerOps.length} endpoints):
-${apiSummaryList}
-
-Nhiệm vụ:
-- Nếu yêu cầu của người dùng cần gọi REST API (thực hiện nghiệp vụ tạo, sửa, xóa, lấy thông tin theo API), hãy chọn tối đa 3 API phù hợp nhất và trả về mảng JSON chứa các số thứ tự index trong danh sách trên (ví dụ: [0, 4]).
-- Nếu câu hỏi chỉ là chào hỏi, hỏi đáp chính sách chung hoặc là báo cáo/tra cứu số liệu DB (không dùng REST API), hãy trả về [].
-Chỉ trả về JSON array thuần túy, ví dụ: [0] hoặc []`;
-
-      const apiLocatorRaw = await callInternalLlm([{ role: "user", content: apiLocatorPrompt }]);
-      const selectedIndices = parseJsonArrayOfIndices(apiLocatorRaw, swaggerOps.length);
-
-      const selectedOps = selectedIndices.map((i) => swaggerOps[i]);
-      selectedApiOpsCount = selectedOps.length;
-      if (selectedOps.length > 0) {
-        onProgressStatus?.(
-          `Đang nạp chi tiết cấu trúc API: ${selectedOps.map((op) => `${op.action} ${op.endpoint}`).join(", ")}...`
-        );
-        apiDetailedPromptSection = formatDetailedOperations(selectedOps);
-        opsListStr = formatOperationsForPrompt(selectedOps);
-      } else {
-        opsListStr = "Không có REST API nào khớp với yêu cầu này.";
-      }
-    }
-  }
-
-  // =========================================================================
-  // TẦNG 1: RULE LUỒNG CỐ ĐỊNH (Đọc từ file .md - LUÔN ĐƯỢC TRUYỀN VÀO PROMPT)
-  // =========================================================================
-  const coreFlowRules = (appConfig.domainPlaybook || "").trim();
-
-  // =========================================================================
-  // BƯỚC 2: LUỒNG SEARCH NGHIỆP VỤ TRONG DB KIẾN THỨC (Knowledge DB Search Locator)
-  // Nằm ở giữa OpenAPI Locator và DB Table Locator để:
-  // 1) Tải danh mục các mục kiến thức từ bảng SQLite DB (`knowledge_chunks`).
-  // 2) Nhận diện tự nhiên nếu chỉ là câu chào hỏi / hội thoại xã giao để phản hồi ngay (không cần gọi DB).
-  // 3) Tìm ra đúng các mục kiến thức nghiệp vụ trong DB (`matchedKnowledgeFromDb`) để truyền cùng `coreFlowRules` cho DB Table Locator ở Bước 3 và Planner ở Bước 5.
-  // =========================================================================
-  const knowledgeAppKey = appConfig.appId || appConfig.microsoftClientKey;
-  const knowledgeChunks = loadKnowledgeChunksFromDb(knowledgeAppKey);
-  let matchedKnowledgeFromDb = "";
-
-  if (selectedApiOpsCount === 0 && Object.keys(userSuppliedInputs || {}).length === 0) {
-    onProgressStatus?.("Đang tra cứu kiến thức nghiệp vụ trong DB...");
-    const knowledgeCatalog = buildRuleBookCatalogForLocator(knowledgeChunks);
-
-    const ruleSearchPrompt = `Bạn là bộ định vị Kiến thức Nghiệp vụ trong DB (Knowledge DB Search Locator) cho hệ thống ${appConfig.name}.
-Câu của người dùng: "${instruction}"
-${coreFlowRules ? `\nRULE LUỒNG CỐ ĐỊNH CỦA HỆ THỐNG:\n${coreFlowRules}\n` : ""}
-Danh mục Kho Kiến thức Nghiệp vụ trong DB (${knowledgeChunks.length} mục):
-${knowledgeCatalog || "(Kho kiến thức trong DB hiện đang trống)"}
-
-Nhiệm vụ của bạn:
-1. Nếu câu của người dùng CHỈ LÀ câu chào hỏi xã giao, cảm ơn, tạm biệt, hoặc hỏi bạn là ai / làm được gì (không yêu cầu tra cứu dữ liệu, không hỏi nghiệp vụ hay thực hiện tác vụ):
-   - Đặt "isGreetingOrChat": true
-   - Đặt "greetingReply": Câu trả lời chào hỏi ngắn gọn, thân thiện, lịch sự bằng tiếng Việt với vai trò Trợ lý AI của ${appConfig.name}
-   - Đặt "ruleIndices": []
-2. Nếu câu của người dùng có liên quan đến nghiệp vụ, báo cáo, số liệu, quy trình hoặc tra cứu dữ liệu:
-   - Đặt "isGreetingOrChat": false
-   - Đặt "ruleIndices": Mảng số thứ tự index của tối đa 4 mục Kiến thức nghiệp vụ trong DB có liên quan nhất tới câu hỏi (nếu Kho kiến thức trong DB có mục phù hợp).
-
-Chỉ trả về DUY NHẤT một chuỗi JSON chuẩn:
-{"isGreetingOrChat": false, "ruleIndices": [0, 1, 2], "greetingReply": ""}`;
-
-    const ruleLocatorRaw = await callInternalLlm([{ role: "user", content: ruleSearchPrompt }]);
-    const ruleLocatorJsonStr = extractFirstJsonObject(ruleLocatorRaw);
-    if (ruleLocatorJsonStr) {
-      try {
-        const parsedRuleLoc = JSON.parse(ruleLocatorJsonStr);
-        if (parsedRuleLoc?.isGreetingOrChat === true) {
-          return {
-            thought: "Câu chào hỏi hoặc hội thoại chung được nhận diện tại bước Search Nghiệp Vụ.",
-            planName: "Phản hồi trực tiếp",
-            directAnswer:
-              (typeof parsedRuleLoc.greetingReply === "string" &&
-                parsedRuleLoc.greetingReply.trim()) ||
-              appConfig.welcomeMessage ||
-              `Xin chào! Tôi là trợ lý AI của ${appConfig.name}. Tôi có thể giúp bạn tra cứu dữ liệu và lập báo cáo.`,
-            steps: [
-              {
-                stepIndex: 0,
-                name: "Phản hồi trực tiếp",
-                action: "DIRECT",
-                status: "success",
-              },
-            ],
-          };
-        }
-
-        if (knowledgeChunks.length > 0) {
-          const indices = Array.isArray(parsedRuleLoc?.ruleIndices)
-            ? parsedRuleLoc.ruleIndices.filter((n: any) => typeof n === "number")
-            : [];
-          const assembled = assembleSelectedRuleChunks(knowledgeChunks, indices);
-          if (assembled.matchedContent) {
-            matchedKnowledgeFromDb = assembled.matchedContent;
-          }
-        }
-      } catch {
-        if (knowledgeChunks.length > 0) {
-          const fallbackAssembled = assembleSelectedRuleChunks(knowledgeChunks, []);
-          if (fallbackAssembled.matchedContent) {
-            matchedKnowledgeFromDb = fallbackAssembled.matchedContent;
-          }
-        }
-      }
-    } else if (knowledgeChunks.length > 0) {
-      const fallbackAssembled = assembleSelectedRuleChunks(knowledgeChunks, []);
-      if (fallbackAssembled.matchedContent) {
-        matchedKnowledgeFromDb = fallbackAssembled.matchedContent;
-      }
-    }
-  } else if (knowledgeChunks.length > 0) {
-    const fallbackAssembled = assembleSelectedRuleChunks(knowledgeChunks, []);
-    if (fallbackAssembled.matchedContent) {
-      matchedKnowledgeFromDb = fallbackAssembled.matchedContent;
-    }
-  }
-
-  // Kết hợp Tầng 1 (Rule luồng cố định từ file .md - luôn truyền) + Tầng 2 (Kiến thức nghiệp vụ search từ DB)
-  const combinedRulesAndKnowledge = [
-    coreFlowRules ? `=== RULE LUỒNG CỐ ĐỊNH (.MD) ===\n${coreFlowRules}` : "",
-    matchedKnowledgeFromDb
-      ? `=== KIẾN THỨC NGHIỆP VỤ TRA CỨU TỪ DB ===\n${matchedKnowledgeFromDb}`
-      : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  // =========================================================================
-  // BƯỚC 3: ĐỊNH VỊ BẢNG DỮ LIỆU (DB Table Locator)
-  // Nhận trực tiếp Rule Luồng Cố Định + Kiến Thức Nghiệp Vụ từ DB ở Bước 2
-  // =========================================================================
-  let dbSchemaPromptSection = "";
   const targetAppId = context?.applicationId || context?.dbProfile || "";
   const hasAppIdFromChat = Boolean(targetAppId);
   const supportsSql =
     hasAppIdFromChat &&
     (appConfig.capabilities?.includes("sql") ?? Boolean(appConfig.schemaEndpointUrl)) &&
     Boolean(appConfig.schemaEndpointUrl);
-
-  // Chỉ chạy DB Table Locator khi hỗ trợ SQL và không phải là lệnh gọi REST API thuần túy đã xác định
-  const shouldInspectDbSchema =
-    supportsSql && Boolean(appConfig.schemaEndpointUrl) && selectedApiOpsCount === 0;
-
-  if (shouldInspectDbSchema && appConfig.schemaEndpointUrl) {
-    const summaryData = await fetchSchemaFromBackend(
-      appConfig.schemaEndpointUrl,
-      targetAppId,
-      "summary",
-      undefined,
-      userAuthToken
-    );
-
-    const allTables: string[] = Array.isArray(summaryData?.tables) ? summaryData.tables : [];
-    if (allTables.length === 0) {
-      throw new Error(
-        `Không tìm thấy bảng dữ liệu nào trong cấu hình cơ sở dữ liệu của ứng dụng '${targetAppId}'.`
-      );
-    }
-
-    onProgressStatus?.("Đang kiểm tra dữ liệu và bảng liên quan...");
-    const businessRulesContextBlock = combinedRulesAndKnowledge
-      ? `\nRULE LUỒNG CỐ ĐỊNH & KIẾN THỨC NGHIỆP VỤ TỪ DB:\n${combinedRulesAndKnowledge}\n`
-      : "";
-
-    const locatorPrompt = `Bạn là bộ định vị bảng dữ liệu (DB Table Locator) cho ứng dụng ${appConfig.name}.
-Câu hỏi của người dùng: "${instruction}"
-${businessRulesContextBlock}
-Danh sách các bảng hiện có trong DB (${allTables.length} bảng):
-${allTables.join(", ")}
-
-Nhiệm vụ:
-- Dựa vào RULE LUỒNG CỐ ĐỊNH & KIẾN THỨC NGHIỆP VỤ ở trên và danh sách bảng hiện có trong DB, nếu câu hỏi cần tra cứu / tổng hợp số liệu từ DB, hãy trả về mảng JSON chứa tối đa 8 tên bảng liên quan nhất.
-- Nếu câu hỏi yêu cầu dữ liệu hoàn toàn không tồn tại trong danh sách bảng DB của hệ thống (ví dụ hỏi nghiệp vụ ngoài phạm vi hệ thống) hoặc không cần truy vấn DB, hãy trả về [].
-Chỉ trả về JSON array thuần túy, ví dụ: ["SaleService", "SaleServiceDetail"]`;
-
-    const locatorRaw = await callInternalLlm([{ role: "user", content: locatorPrompt }]);
-    const selectedTables = parseJsonArrayOfStrings(locatorRaw, allTables);
-
-    // =========================================================================
-    // BƯỚC 4: NẠP CẤU TRÚC BẢNG CHI TIẾT (DB Schema Detail Introspection)
-    // =========================================================================
-    if (selectedTables.length > 0) {
-      onProgressStatus?.(`Đang nạp cấu trúc chi tiết bảng: ${selectedTables.join(", ")}...`);
-      const detailData = await fetchSchemaFromBackend(
-        appConfig.schemaEndpointUrl,
-        targetAppId,
-        "detail",
-        selectedTables,
-        userAuthToken
-      );
-      if (
-        !detailData?.tables ||
-        !Array.isArray(detailData.tables) ||
-        detailData.tables.length === 0
-      ) {
-        throw new Error(
-          `Không thể lấy cấu trúc chi tiết cho các bảng [${selectedTables.join(", ")}] từ máy chủ DB.`
-        );
-      }
-      const lines = detailData.tables.map(
-        (t: any) => `- ${t.table}: ${(t.columns || []).join(", ")}`
-      );
-      dbSchemaPromptSection = `\nCẤU TRÚC BẢNG CƠ SỞ DỮ LIỆU CHI TIẾT:\n${lines.join("\n")}\n`;
-    }
-  }
-
-  const hasDetailedDbSchema = Boolean(dbSchemaPromptSection.trim());
   const sqlEndpoint = appConfig.sqlExecuteEndpoint || "/api/ai-report/execute-sql";
 
-  const dbSupportInstruction = !hasAppIdFromChat
-    ? `\n⚠️ LƯU Ý VỀ DỮ LIỆU BÁO CÁO:
-Phiên chat hiện tại không được cấp quyền tra cứu cơ sở dữ liệu (không có appId).
-Vì vậy:
-- TUYỆT ĐỐI KHÔNG sinh lệnh gọi API truy vấn SQL (${sqlEndpoint}).
-- Nếu người dùng hỏi bất kỳ câu hỏi nào cần tra cứu số liệu, báo cáo, doanh thu, đơn hàng, hóa đơn, tồn kho, v.v.:
-  BẠN BẮT BUỘC trả về trực tiếp (directAnswer) ngắn gọn:
-  "Rất tiếc, tính năng tra cứu dữ liệu và báo cáo hiện chưa được hỗ trợ."
-  (Và đặt "action": null, "endpoint": null).\n`
-    : !hasDetailedDbSchema
-      ? `\n⚠️ CHỐT CHẶN AN TOÀN SCHEMA (FAIL-FAST):
-Hiện tại KHÔNG tìm thấy bảng cơ sở dữ liệu nào khớp với câu hỏi này (không có cấu trúc bảng chi tiết).
-- TUYỆT ĐỐI CẤM tự suy đoán tên bảng hay tên cột để sinh truy vấn SQL (${sqlEndpoint}).
-- Nếu người dùng đang yêu cầu tra cứu số liệu / báo cáo từ DB, hãy đặt "action": null, "endpoint": null và trả về "directAnswer" thông báo rõ ràng rằng không tìm thấy bảng dữ liệu phù hợp với yêu cầu, đề nghị người dùng nêu rõ hơn nghiệp vụ cần tra cứu.\n`
-      : "";
+  // Layer 1: Rule Luồng Cố Định (.md)
+  const coreFlowRules = (appConfig.domainPlaybook || "").trim();
+  const knowledgeAppKey = appConfig.appId || appConfig.microsoftClientKey;
 
-  const enrichedContext = {
-    currentTime: new Date().toISOString(),
-    ...context,
-    ...userSuppliedInputs,
-  };
+  // Danh sách công cụ (Tools) cung cấp cho AI
+  const tools: any[] = [];
 
-  // =========================================================================
-  // BƯỚC 5: LẬP KẾ HOẠCH HÀNH ĐỘNG (Planner)
-  // Luôn truyền Rule Luồng Cố Định (.md) + Kiến Thức Nghiệp Vụ từ DB (nếu có)
-  // =========================================================================
-  const effectivePlaybook = combinedRulesAndKnowledge || "Bạn là trợ lý AI thông minh.";
+  // Tool 1: search_knowledge (Multi-Search FTS5 + Semantic + RRF + Cross-Encoder Reranker)
+  tools.push({
+    type: "function",
+    function: {
+      name: "search_knowledge",
+      description:
+        "Tra cứu cơ sở tri thức nghiệp vụ, quy tắc tính toán, tài liệu hoặc chính sách từ CSDL tri thức. Sử dụng Multi-Search (FTS5 + Semantic) kết hợp Cross-Encoder Reranker để lấy top các đoạn thông tin chính xác nhất. Gọi khi cần biết quy tắc nghiệp vụ, công thức tính tiền/chiết khấu, hoặc chính sách hoàn huỷ.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Từ khóa hoặc câu hỏi cần tra cứu kiến thức" },
+          topK: { type: "number", description: "Số lượng đoạn kiến thức cần lấy (mặc định 3)" },
+        },
+        required: ["query"],
+      },
+    },
+  });
 
-  const systemPrompt = `${effectivePlaybook}
-${dbSupportInstruction}
-HỆ THỐNG API KHẢ DỤNG (OpenAPI):
-${opsListStr}
-${apiDetailedPromptSection}
-${dbSchemaPromptSection}
-BỐI CẢNH HIỆN TẠI (Context):
-${JSON.stringify(enrichedContext, null, 2)}
+  // Tool 2 & 3: DB Schema tools (nếu hỗ trợ SQL)
+  if (supportsSql && appConfig.schemaEndpointUrl) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "list_tables",
+        description:
+          "Liệt kê danh sách tên bảng trong CSDL của hệ thống. Dùng khi người dùng yêu cầu lập báo cáo hoặc tra cứu dữ liệu số liệu thực tế.",
+        parameters: {
+          type: "object",
+          properties: {
+            keyword: { type: "string", description: "Từ khóa tùy chọn để lọc danh sách tên bảng" },
+          },
+        },
+      },
+    });
 
-NHIỆM VỤ CỦA BẠN:
-Phân tích yêu cầu của người dùng: "${instruction}"
-Và trả về DUY NHẤT một chuỗi JSON chuẩn (không dùng markdown code fence, không kèm lời giải thích bên ngoài):
-{
-  "thought": "Suy luận phân tích chi tiết ngắn gọn",
-  "planName": "Tiêu đề hành động chính bằng tiếng Việt",
-  "steps": [
-    {
-      "stepIndex": 0,
-      "name": "Tên bước hành động cụ thể do bạn sinh ra theo ngữ cảnh câu hỏi",
-      "action": "GET hoặc POST hoặc PUT hoặc DELETE hoặc SCHEMA hoặc SQL",
-      "endpoint": "URL endpoint (nếu có)"
-    }
-  ],
-  "action": "GET hoặc POST hoặc PUT hoặc DELETE (hoặc null nếu chỉ trả lời trò chuyện)",
-  "endpoint": "URL endpoint chính xác (ví dụ: /api/v1/tickets hoặc ${sqlEndpoint})",
-  "resolvedPayload": { "field": "value" },
-  "missingRequiredFields": [
-    {
-      "fieldName": "tên_trường",
-      "fieldLabel": "Tên tiếng Việt hiển thị cho người dùng",
-      "fieldType": "string hoặc number hoặc date hoặc select",
-      "isRequired": true,
-      "options": [{ "label": "Tên", "value": "giá_trị" }]
-    }
-  ],
-  "requiresConfirmation": true/false (true nếu là thao tác POST/PUT/DELETE làm thay đổi dữ liệu nghiệp vụ; true nếu là truy vấn báo cáo ${sqlEndpoint} có phạm vi dữ liệu lớn: không có bộ lọc ngày, hoặc thời gian > 3 tháng, cả năm, từ trước đến nay, toàn bộ lịch sử, hoặc quét chi tiết bảng lớn không có TOP - khi đó đặt directAnswer chứa cảnh báo rõ ràng; false nếu là truy vấn an toàn có giới hạn ngày trong vòng 1 tháng hoặc có TOP <= 100),
-  "directAnswer": "Câu trả lời trực tiếp hoặc thông điệp cảnh báo yêu cầu xác nhận khi requiresConfirmation=true"
-}
-
-QUY TẮC BƯỚC ĐỘNG (steps):
-- Tuyệt đối không fix cứng các bước. Dựa vào yêu cầu cụ thể để sinh từ 1 đến 3 bước động phản ánh đúng lộ trình phân tích và xử lý.
-- Nếu người dùng chỉ chào hỏi hoặc hỏi đáp thuần túy: "steps" có 1 bước (ví dụ: "Phản hồi trực tiếp", action: "DIRECT").
-- Nếu người dùng yêu cầu tra cứu/báo cáo/thực thi: "steps" mô tả rõ các bước cụ thể theo đúng tên bảng/API đang dùng.
-
-QUY TẮC ĐẶC BIỆT KHI GỌI BÁO CÁO SQL (${sqlEndpoint}):
-- "resolvedPayload" cần có cấu trúc:
-  {
-    "sql": "Câu truy vấn T-SQL chuẩn",
-    "summary": "Tóm tắt ngắn gọn báo cáo",
-    "chartSpec": { ... } (chỉ tạo khi thỏa mãn quy tắc dưới đây)
+    tools.push({
+      type: "function",
+      function: {
+        name: "describe_tables",
+        description:
+          "Lấy cấu trúc chi tiết các cột, kiểu dữ liệu, khóa chính/ngoại của tối đa 6 bảng CSDL. Bắt buộc phải gọi xem cấu trúc trước khi sinh SQL.",
+        parameters: {
+          type: "object",
+          properties: {
+            tables: {
+              type: "array",
+              items: { type: "string" },
+              description: "Danh sách tên bảng cần xem cấu trúc chi tiết",
+            },
+          },
+          required: ["tables"],
+        },
+      },
+    });
   }
-- QUY TẮC VỀ BIỂU ĐỒ (chartSpec):
-  1. CHỈ SINH "chartSpec" KHI NGƯỜI DÙNG CÓ YÊU CẦU RÕ RÀNG VỀ BIỂU ĐỒ:
-     - Ví dụ người dùng yêu cầu: "vẽ biểu đồ", "tạo biểu đồ tròn", "biểu đồ cột", "biểu đồ đường", "tỷ lệ cơ cấu", "vẽ chart", "thể hiện dạng biểu đồ"...
-     - Cấu trúc "chartSpec":
-       {
-         "chartType": "pie | bar | line",
-         "title": "Tiêu đề biểu đồ tiếng Việt",
-         "categoryColumn": "Tên_cột_nhãn_trục_X_trong_SQL",
-         "valueColumns": ["Tên_cột_số_liệu_trục_Y_trong_SQL"]
-       }
-       + Nếu người dùng yêu cầu biểu đồ tròn hoặc cơ cấu/tỷ lệ: chọn "chartType": "pie".
-       + Nếu người dùng yêu cầu biểu đồ cột hoặc so sánh danh mục/doanh thu: chọn "chartType": "bar".
-       + Nếu người dùng yêu cầu biểu đồ đường hoặc theo dõi xu hướng theo ngày/tháng/thời gian: chọn "chartType": "line".
-  2. KHI NGƯỜI DÙNG KHÔNG YÊU CẦU BIỂU ĐỒ:
-     - Ví dụ tra cứu danh sách chi tiết: "cho tôi tất cả các phiếu dịch vụ trong tuần này", "danh sách khách hàng", "xem đơn hàng hôm nay", "tra cứu vật tư"...
-     - TUYỆT ĐỐI KHÔNG sinh trường "chartSpec" (hoặc đặt "chartSpec": null) để hệ thống chỉ hiển thị bảng dữ liệu chi tiết, tránh tự tiện vẽ biểu đồ khi người dùng không yêu cầu.`;
 
-  const completion = await callInternalLlm([
+  // Tool 4 & 5: OpenAPI tools (nếu có swagger)
+  let cachedSwaggerOps: any[] | null = null;
+  if (appConfig.swaggerEndpointUrl) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "search_api",
+        description:
+          "Tìm kiếm các REST API endpoint hiện có trong hệ thống theo chức năng cần thực hiện.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Từ khóa tìm kiếm API nghiệp vụ" },
+          },
+          required: ["query"],
+        },
+      },
+    });
+
+    tools.push({
+      type: "function",
+      function: {
+        name: "describe_api",
+        description:
+          "Lấy cấu trúc chi tiết request/response của các REST API endpoint được chỉ định.",
+        parameters: {
+          type: "object",
+          properties: {
+            indices: {
+              type: "array",
+              items: { type: "number" },
+              description: "Danh sách chỉ số index của endpoint cần xem chi tiết",
+            },
+          },
+          required: ["indices"],
+        },
+      },
+    });
+  }
+
+  // Tool 6: submit_plan (terminal tool)
+  tools.push({
+    type: "function",
+    function: {
+      name: "submit_plan",
+      description:
+        "Hoàn tất kế hoạch xử lý và trả kết quả cho người dùng. Bắt buộc gọi hàm này khi: (1) Trả lời câu chào hỏi hoặc giải đáp kiến thức trực tiếp (action='direct_answer'), hoặc (2) Đã có đủ bảng và cấu trúc để sinh câu lệnh SQL (action='report_sql'), hoặc (3) Thực thi API nghiệp vụ (action='GET'|'POST'|'PUT'|'DELETE').",
+      parameters: {
+        type: "object",
+        properties: {
+          thought: { type: "string", description: "Suy nghĩ phân tích lý do chọn hành động này" },
+          planName: { type: "string", description: "Tên ngắn gọn của hành động" },
+          action: {
+            type: "string",
+            enum: ["direct_answer", "report_sql", "GET", "POST", "PUT", "DELETE"],
+          },
+          endpoint: { type: "string", description: `Endpoint URL (ví dụ: '${sqlEndpoint}' khi là report_sql)` },
+          resolvedPayload: {
+            type: "object",
+            description:
+              "Payload truyền vào API hoặc { sql, summary, chartSpec } nếu action là report_sql",
+          },
+          directAnswer: {
+            type: "string",
+            description:
+              "Nội dung câu trả lời trực tiếp cho người dùng nếu action là direct_answer",
+          },
+          requiresConfirmation: {
+            type: "boolean",
+            description: "true nếu cần người dùng bấm xác nhận trước khi thực thi",
+          },
+          confirmationMessage: { type: "string", description: "Thông điệp hiển thị khi yêu cầu xác nhận" },
+          missingRequiredFields: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                fieldName: { type: "string" },
+                label: { type: "string" },
+                type: { type: "string" },
+                description: { type: "string" },
+              },
+              required: ["fieldName", "label"],
+            },
+          },
+        },
+        required: ["thought", "planName", "action"],
+      },
+    },
+  });
+
+  // System Prompt với Tầng 1: Rule Luồng Cố Định (.md)
+  const systemPrompt = `Bạn là Trợ lý AI Orchestrator chuyên nghiệp của ứng dụng ${appConfig.name}.
+Mô tả ứng dụng: ${appConfig.description || "Hệ thống hỗ trợ quản trị và báo cáo doanh nghiệp"}.
+Ngữ cảnh người dùng:
+- Application ID: "${targetAppId || "Không có (chế độ hỏi đáp chung)"}"
+- Chi nhánh (BranchCode): "${context?.branchCode || context?.userBranch || "Tất cả"}"
+${Object.keys(userSuppliedInputs || {}).length > 0 ? `- Tham số người dùng đã cung cấp: ${JSON.stringify(userSuppliedInputs)}` : ""}
+
+=== TẦNG 1: RULE LUỒNG CỐ ĐỊNH (.MD) ===
+${coreFlowRules || "Không có quy tắc luồng cố định."}
+
+=== NGUYÊN TẮC HÀNH ĐỘNG AGENTIC ===
+Bạn có các công cụ được cung cấp và BẮT BUỘC tuân thủ các quy tắc sau:
+1. NẾU NGƯỜI DÙNG CHÀO HỎI / GIAO TIẾP XÃ GIAO:
+   - Gọi ngay \`submit_plan\` ở lượt đầu tiên với \`action: "direct_answer"\` và câu chào mừng lịch sự, thân thiện.
+   - Tuyệt đối KHÔNG gọi công cụ tra cứu kiến thức hay cơ sở dữ liệu.
+2. NẾU NGƯỜI DÙNG HỎI VỀ KIẾN THỨC NGHIỆP VỤ / QUY TẮC / CÔNG THỨC / CHÍNH SÁCH:
+   - Gọi công cụ \`search_knowledge\` với từ khóa phù hợp để lấy kiến thức từ DB (Multi-Search + Reranker).
+   - Sau khi nhận được kết quả tri thức ở lượt tiếp theo, hãy tổng hợp câu trả lời đầy đủ, chính xác và gọi \`submit_plan\` với \`action: "direct_answer"\`.
+3. NẾU NGƯỜI DÙNG YÊU CẦU BÁO CÁO HOẶC TRA CỨU SỐ LIỆU CSDL:
+   - Bước 1: Gọi \`list_tables\` để xem danh sách bảng có trong hệ thống.
+   - Bước 2: Gọi \`describe_tables\` để nạp cấu trúc chi tiết các cột cần truy vấn (tối đa 6 bảng liên quan).
+   - Bước 3: Sau khi đã nắm rõ cấu trúc bảng và kiểu dữ liệu, gọi \`submit_plan\` với:
+     * \`action\`: "report_sql"
+     * \`endpoint\`: "${sqlEndpoint}"
+     * \`resolvedPayload\`:
+       {
+         "sql": "Câu lệnh SELECT T-SQL an toàn, chính xác",
+         "summary": "Tóm tắt ngắn gọn báo cáo",
+         "chartSpec": { ... } (chỉ tạo khi người dùng có yêu cầu rõ ràng về vẽ biểu đồ tròn/cột/đường, nếu không thì null)
+       }
+   - QUY TẮC SQL AN TOÀN:
+     * Chỉ dùng SELECT, tuyệt đối không INSERT, UPDATE, DELETE, DROP, ALTER, EXEC.
+     * Luôn tự động bổ sung điều kiện lọc theo chi nhánh nếu người dùng thuộc chi nhánh cụ thể.
+4. NẾU NGƯỜI DÙNG YÊU CẦU THỰC HIỆN NGHIỆP VỤ REST API:
+   - Dùng \`search_api\` và \`describe_api\` để tìm endpoint và schema payload phù hợp, sau đó gọi \`submit_plan\`.`;
+
+  const messages: any[] = [
     { role: "system", content: systemPrompt },
     { role: "user", content: instruction },
-  ]);
+  ];
 
-  return parsePlanOutput(completion, appConfig, hasDetailedDbSchema);
+  let turn = 0;
+  const maxTurns = 4;
+  const executionSteps: ActionPlanStepItem[] = [];
+
+  while (turn < maxTurns) {
+    turn++;
+
+    const isLastTurn = turn === maxTurns;
+    const toolChoice = isLastTurn
+      ? { type: "function", function: { name: "submit_plan" } }
+      : undefined;
+
+    const response = await callInternalLlmWithTools(messages, tools, toolChoice);
+
+    if (response.toolCalls && response.toolCalls.length > 0) {
+      messages.push({
+        role: "assistant",
+        content: response.content || null,
+        tool_calls: response.toolCalls,
+      });
+
+      let submittedPlan: PlanOutput | null = null;
+
+      for (const call of response.toolCalls) {
+        const fnName = call.function.name;
+        let args: any = {};
+        try {
+          args = JSON.parse(call.function.arguments);
+        } catch {
+          args = {};
+        }
+
+        if (fnName === "submit_plan") {
+          submittedPlan = {
+            thought: args.thought || "Đã phân tích yêu cầu",
+            planName: args.planName || "Kế hoạch xử lý",
+            action: args.action || "direct_answer",
+            endpoint: args.endpoint || (args.action === "report_sql" ? sqlEndpoint : undefined),
+            resolvedPayload: args.resolvedPayload,
+            directAnswer: args.directAnswer,
+            requiresConfirmation: Boolean(args.requiresConfirmation),
+            confirmationMessage: args.confirmationMessage,
+            missingRequiredFields: Array.isArray(args.missingRequiredFields)
+              ? args.missingRequiredFields
+              : undefined,
+          };
+          break;
+        }
+
+        let toolResultStr = "";
+        if (fnName === "search_knowledge") {
+          onProgressStatus?.(`Đang tra cứu cơ sở tri thức: "${args.query || instruction}"...`);
+          const searchRes = await searchKnowledgeBase(knowledgeAppKey, args.query || instruction, {
+            topK: typeof args.topK === "number" ? args.topK : 3,
+          });
+          toolResultStr = searchRes.matchedContent || "Không tìm thấy đoạn kiến thức phù hợp trong DB.";
+          executionSteps.push({
+            stepIndex: executionSteps.length,
+            name: `Tra cứu tri thức: ${args.query || instruction}`,
+            action: "KNOWLEDGE",
+            status: "success",
+          });
+        } else if (fnName === "list_tables") {
+          onProgressStatus?.("Đang kiểm tra danh mục bảng CSDL...");
+          try {
+            const summaryData = await fetchSchemaFromBackend(
+              appConfig.schemaEndpointUrl!,
+              targetAppId,
+              "summary",
+              undefined,
+              userAuthToken
+            );
+            const allTables: string[] = Array.isArray(summaryData?.tables) ? summaryData.tables : [];
+            const keyword = String(args.keyword || "").trim().toLowerCase();
+            const filteredTables = keyword
+              ? allTables.filter((t) => t.toLowerCase().includes(keyword))
+              : allTables;
+            toolResultStr = JSON.stringify({ totalTables: allTables.length, tables: filteredTables.slice(0, 50) });
+            executionSteps.push({
+              stepIndex: executionSteps.length,
+              name: "Liệt kê danh mục bảng CSDL",
+              action: "SCHEMA_LIST",
+              status: "success",
+            });
+          } catch (err: any) {
+            toolResultStr = `Lỗi tra cứu bảng CSDL: ${err?.message || err}`;
+          }
+        } else if (fnName === "describe_tables") {
+          const reqTables: string[] = Array.isArray(args.tables) ? args.tables.slice(0, 6) : [];
+          onProgressStatus?.(`Đang xem cấu trúc bảng: ${reqTables.join(", ")}...`);
+          try {
+            const detailData = await fetchSchemaFromBackend(
+              appConfig.schemaEndpointUrl!,
+              targetAppId,
+              "detail",
+              reqTables,
+              userAuthToken
+            );
+            toolResultStr = JSON.stringify(detailData || {});
+            executionSteps.push({
+              stepIndex: executionSteps.length,
+              name: `Xem cấu trúc bảng: ${reqTables.join(", ")}`,
+              action: "SCHEMA_DETAIL",
+              status: "success",
+            });
+          } catch (err: any) {
+            toolResultStr = `Lỗi xem chi tiết bảng: ${err?.message || err}`;
+          }
+        } else if (fnName === "search_api") {
+          onProgressStatus?.(`Đang tìm kiếm API: "${args.query}"...`);
+          try {
+            if (!cachedSwaggerOps) {
+              cachedSwaggerOps = await getSwaggerOperations(appConfig.swaggerEndpointUrl!, true);
+            }
+            const queryLower = String(args.query || "").toLowerCase();
+            const matchedOps = cachedSwaggerOps.filter(
+              (op) =>
+                op.endpoint.toLowerCase().includes(queryLower) ||
+                (op.summary && op.summary.toLowerCase().includes(queryLower)) ||
+                (op.description && op.description.toLowerCase().includes(queryLower))
+            );
+            toolResultStr = formatOperationsForPrompt(matchedOps.slice(0, 8));
+            executionSteps.push({
+              stepIndex: executionSteps.length,
+              name: `Tìm kiếm API: ${args.query}`,
+              action: "API_SEARCH",
+              status: "success",
+            });
+          } catch (err: any) {
+            toolResultStr = `Lỗi tìm API: ${err?.message || err}`;
+          }
+        } else if (fnName === "describe_api") {
+          try {
+            if (!cachedSwaggerOps) {
+              cachedSwaggerOps = await getSwaggerOperations(appConfig.swaggerEndpointUrl!, true);
+            }
+            const indices: number[] = Array.isArray(args.indices) ? args.indices : [];
+            const selectedOps = indices
+              .filter((i) => i >= 0 && i < (cachedSwaggerOps?.length || 0))
+              .map((i) => cachedSwaggerOps![i]);
+            toolResultStr = formatDetailedOperations(selectedOps);
+            executionSteps.push({
+              stepIndex: executionSteps.length,
+              name: "Nạp chi tiết cấu trúc API",
+              action: "API_DETAIL",
+              status: "success",
+            });
+          } catch (err: any) {
+            toolResultStr = `Lỗi xem chi tiết API: ${err?.message || err}`;
+          }
+        }
+
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: toolResultStr,
+        });
+      }
+
+      if (submittedPlan) {
+        if (!submittedPlan.steps || submittedPlan.steps.length === 0) {
+          if (executionSteps.length > 0) {
+            submittedPlan.steps = executionSteps;
+          } else {
+            submittedPlan.steps = [
+              {
+                stepIndex: 0,
+                name: submittedPlan.planName,
+                action: submittedPlan.action === "report_sql" ? "SQL" : "DIRECT",
+                status: "success",
+              },
+            ];
+          }
+        }
+        return submittedPlan;
+      }
+    } else if (response.content) {
+      // LLM trả lời trực tiếp mà không gọi submit_plan
+      return {
+        thought: "Phản hồi trực tiếp từ AI Orchestrator",
+        planName: "Phản hồi trực tiếp",
+        action: "direct_answer",
+        directAnswer: response.content,
+        steps: [
+          {
+            stepIndex: 0,
+            name: "Phản hồi trực tiếp",
+            action: "DIRECT",
+            status: "success",
+          },
+        ],
+      };
+    }
+  }
+
+  // Fallback an toàn nếu hết số lượt
+  return {
+    thought: "Đã hoàn thành vòng lặp xử lý",
+    planName: "Phản hồi hệ thống",
+    action: "direct_answer",
+    directAnswer:
+      "Yêu cầu của bạn đã được ghi nhận. Vui lòng cung cấp thêm thông tin chi tiết để tôi có thể hỗ trợ tốt nhất.",
+    steps: [
+      {
+        stepIndex: 0,
+        name: "Phản hồi hệ thống",
+        action: "DIRECT",
+        status: "success",
+      },
+    ],
+  };
 }
 
 export function buildSafeSynthesisPayload(apiResponseData: any): string {

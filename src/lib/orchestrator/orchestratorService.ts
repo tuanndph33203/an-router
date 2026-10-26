@@ -148,7 +148,7 @@ export class OrchestratorService {
     });
 
     // 1. Trường hợp trả lời trực tiếp không cần API
-    if (plan.directAnswer && !plan.action) {
+    if (plan.directAnswer && (!plan.action || plan.action === "direct_answer" || plan.action === "DIRECT")) {
       return {
         planId,
         applicationId: appId,
@@ -333,7 +333,7 @@ export class OrchestratorService {
     }
 
     // Trường hợp trả lời trực tiếp
-    if (plan.directAnswer && !plan.action) {
+    if (plan.directAnswer && (!plan.action || plan.action === "direct_answer" || plan.action === "DIRECT")) {
       sendEvent("text_delta", { delta: plan.directAnswer, accumulated: plan.directAnswer });
       sendEvent("done", {
         planId,
