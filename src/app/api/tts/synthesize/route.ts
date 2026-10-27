@@ -27,6 +27,9 @@ export async function POST(req: NextRequest) {
         "X-Voice-Id": result.voiceId,
         "X-Normalized-Text": encodeURIComponent(result.normalizedText),
         "X-Tts-Source": result.source,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        Pragma: "no-cache",
+        Expires: "0",
         "Access-Control-Expose-Headers": "X-Voice-Id, X-Normalized-Text, X-Tts-Source",
       },
     });
