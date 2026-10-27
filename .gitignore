@@ -301,3 +301,9 @@ docker-compose.yml.bak
 
 # run-translation.mjs writes the state atomically via a per-process temp file
 /.i18n-state.json.*.tmp
+
+# Local ONNX TTS models & assets
+/models/
+*.onnx
+src/lib/tts/vendor/
+

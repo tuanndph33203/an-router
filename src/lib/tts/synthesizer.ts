@@ -3,6 +3,7 @@ import path from "node:path";
 import { findVoiceByIdOrName } from "./voiceCatalog.ts";
 import { vietnameseNormalizer } from "./vietnameseNormalizer.ts";
 import { synthesizeGtts } from "../../../open-sse/executors/gtts.ts";
+import { synthesizeNeuralVoice } from "./neuralEngine.ts";
 
 export interface TtsSynthesizeOptions {
   text: string;
@@ -39,8 +40,15 @@ export async function synthesizeSpeech(
   if (isGoogleMode) {
     const lang = options.lang || "vi";
     try {
+      // Ensure sentence punctuation to avoid rising tone or clipped ending
+      let googleInput = normalizedText.trim();
+      const lastCh = googleInput.slice(-1);
+      if (lastCh !== "." && lastCh !== "!" && lastCh !== "?" && lastCh !== "…") {
+        googleInput += ".";
+      }
+
       const mp3Buffer = await synthesizeGtts({
-        text: normalizedText,
+        text: googleInput,
         lang,
       });
 
@@ -56,37 +64,18 @@ export async function synthesizeSpeech(
     }
   }
 
-  // ── Strategy 2: High-speed C# .NET 10 In-Process ONNX Engine (18 Vietnamese Voices) ──
+  // ── Strategy 2: High-Fidelity Neural Engine with eSpeak Phonemizer & Anti-Clip Envelope ──
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-
-    const res = await fetch("http://localhost:5000/api/tts/synthesize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: rawText,
-        voiceId,
-        speed,
-        normalize: shouldNormalize,
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (res.ok) {
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      return {
-        audioBuffer: buffer,
-        contentType: "audio/wav",
-        normalizedText,
-        voiceId,
-        source: "local-engine",
-      };
-    }
-  } catch {
-    // Port 5000 engine not reachable, proceed to local demo sample fallback
+    const wavBuffer = await synthesizeNeuralVoice(normalizedText, voiceId, speed);
+    return {
+      audioBuffer: wavBuffer,
+      contentType: "audio/wav",
+      normalizedText,
+      voiceId,
+      source: "local-engine",
+    };
+  } catch (err: any) {
+    console.warn(`[TTS] Neural engine failed for ${voiceId}:`, err?.message);
   }
 
   // ── Strategy 3: Pre-recorded WAV demo sample fallback ──

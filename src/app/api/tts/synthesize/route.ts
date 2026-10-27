@@ -31,6 +31,7 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message || "Lỗi tổng hợp giọng nói" }, { status: 500 });
+    console.error("[TTS DEBUG ERROR]:", err);
+    return NextResponse.json({ error: err?.message || String(err) }, { status: 500 });
   }
 }
