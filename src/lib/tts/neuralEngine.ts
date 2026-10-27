@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import * as nodeModule from "node:module";
 import { createRequire } from "node:module";
 import { findVoiceByIdOrName } from "./voiceCatalog.ts";
 
@@ -9,13 +10,20 @@ let _ortInstance: any = null;
 function getOrt(): any {
   if (!_ortInstance) {
     _ortInstance = _require("onnxruntime-web");
+    const wasmDir = path.join(process.cwd(), "node_modules", "onnxruntime-web", "dist") + "/";
+    if (_ortInstance?.env?.wasm && fs.existsSync(wasmDir)) {
+      _ortInstance.env.wasm.wasmPaths = wasmDir;
+    }
   }
   return _ortInstance;
 }
 
 let _phonemizeFn: any = null;
-function getPhonemize(): (text: string, options?: any) => Promise<string> {
+function getPhonemize(): (text: string, options?: any) => Promise<string[]> {
   if (!_phonemizeFn) {
+    const fsRequire = nodeModule.createRequire(
+      process.argv[1] || path.join(process.cwd(), "package.json")
+    );
     const candidatePaths = [
       path.join(
         process.cwd(),
@@ -28,23 +36,16 @@ function getPhonemize(): (text: string, options?: any) => Promise<string> {
         "phonemizer.cjs"
       ),
       path.join(process.cwd(), "vendor", "phonemizer", "dist", "phonemizer.cjs"),
-      path.resolve(
-        path.dirname(new URL(import.meta.url).pathname),
-        "vendor",
-        "phonemizer",
-        "dist",
-        "phonemizer.cjs"
-      ),
     ];
     let loaded: any = null;
     for (const p of candidatePaths) {
       if (fs.existsSync(p)) {
-        loaded = _require(p);
+        loaded = Reflect.apply(fsRequire, undefined, [p]);
         break;
       }
     }
     if (!loaded) {
-      loaded = _require(candidatePaths[0]);
+      loaded = Reflect.apply(fsRequire, undefined, [candidatePaths[0]]);
     }
     _phonemizeFn = loaded.phonemize || loaded;
   }
