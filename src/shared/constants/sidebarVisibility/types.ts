@@ -89,6 +89,7 @@ export const HIDEABLE_SIDEBAR_ITEM_IDS = [
   "a2a",
   "plugins",
   "rules",
+  "tts",
   "apps",
   // Gamification
   "leaderboard",

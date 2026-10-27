@@ -1022,6 +1022,8 @@
     "dashboard": "Dashboard",
     "rules": "Domain Rules",
     "rulesSubtitle": "Manage Rule Books Markdown",
+    "ttsStudio": "AI Voice (TTS)",
+    "ttsStudioSubtitle": "Vietnamese Voice Studio 18 Voices",
     "apps": "Connected Apps",
     "appsSubtitle": "OpenAPI profiles & satellite backends",
     "providers": "Providers",

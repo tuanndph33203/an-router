@@ -1022,6 +1022,8 @@
     "dashboard": "Trang tổng quan",
     "rules": "Tài liệu Nghiệp vụ",
     "rulesSubtitle": "Quản lý Rule Books Markdown",
+    "ttsStudio": "Giọng nói AI (TTS)",
+    "ttsStudioSubtitle": "Studio giọng nói Tiếng Việt 18 giọng",
     "apps": "Ứng dụng kết nối",
     "appsSubtitle": "Hồ sơ OpenAPI & Backend vệ tinh",
     "providers": "Nhà cung cấp",

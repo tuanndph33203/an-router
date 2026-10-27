@@ -20,6 +20,7 @@ const PUBLIC_API_ROUTE_PREFIXES = [
   "/api/v1/",
   "/api/oauth/",
   "/api/orchestrator/",
+  "/api/tts/",
   // Public, ticket-gated Codex device-flow completion (validate + persist).
   // The handler enforces its own single-use ticket check; no dashboard auth.
   "/api/codex/connect/",

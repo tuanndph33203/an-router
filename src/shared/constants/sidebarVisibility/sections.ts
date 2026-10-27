@@ -29,6 +29,15 @@ const OMNI_PROXY_ITEMS: readonly SidebarItemDefinition[] = [
     icon: "menu_book",
   },
   {
+    id: "tts",
+    href: "/dashboard/tts",
+    i18nKey: "ttsStudio",
+    subtitleKey: "ttsStudioSubtitle",
+    labelFallback: "Giọng nói AI (TTS)",
+    subtitleFallback: "Studio giọng nói Tiếng Việt 18 giọng",
+    icon: "record_voice_over",
+  },
+  {
     id: "apps",
     href: "/dashboard/apps",
     i18nKey: "apps",
