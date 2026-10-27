@@ -428,11 +428,6 @@ export const EXTRA_MODULE_ENTRIES = [
     dest: ["src", "lib", "tts", "vendor"],
   },
   {
-    label: "TTS models directory",
-    src: ["models"],
-    dest: ["models"],
-  },
-  {
     label: "onnxruntime-web",
     src: ["node_modules", "onnxruntime-web"],
     dest: ["node_modules", "onnxruntime-web"],

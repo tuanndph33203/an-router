@@ -1,125 +1,54 @@
-import fs from "node:fs";
+import { fork, type ChildProcess } from "node:child_process";
 import path from "node:path";
-import * as nodeModule from "node:module";
-import { createRequire } from "node:module";
 import { findVoiceByIdOrName } from "./voiceCatalog.ts";
 
-const _require = createRequire(import.meta.url);
+let workerProc: ChildProcess | null = null;
+let reqSeq = 0;
+const pendingRequests = new Map<
+  number,
+  { resolve: (buf: Buffer) => void; reject: (err: Error) => void }
+>();
 
-let _ortInstance: any = null;
-function getOrt(): any {
-  if (!_ortInstance) {
-    _ortInstance = _require("onnxruntime-web");
-    const wasmDir = path.join(process.cwd(), "node_modules", "onnxruntime-web", "dist") + "/";
-    if (_ortInstance?.env?.wasm && fs.existsSync(wasmDir)) {
-      _ortInstance.env.wasm.wasmPaths = wasmDir;
-    }
-  }
-  return _ortInstance;
-}
-
-let _phonemizeFn: any = null;
-function getPhonemize(): (text: string, options?: any) => Promise<string[]> {
-  if (!_phonemizeFn) {
-    const fsRequire = nodeModule.createRequire(
-      process.argv[1] || path.join(process.cwd(), "package.json")
-    );
-    const candidatePaths = [
-      path.join(
-        process.cwd(),
-        "src",
-        "lib",
-        "tts",
-        "vendor",
-        "phonemizer",
-        "dist",
-        "phonemizer.cjs"
-      ),
-      path.join(process.cwd(), "vendor", "phonemizer", "dist", "phonemizer.cjs"),
-    ];
-    let loaded: any = null;
-    for (const p of candidatePaths) {
-      if (fs.existsSync(p)) {
-        loaded = Reflect.apply(fsRequire, undefined, [p]);
-        break;
-      }
-    }
-    if (!loaded) {
-      loaded = Reflect.apply(fsRequire, undefined, [candidatePaths[0]]);
-    }
-    _phonemizeFn = loaded.phonemize || loaded;
-  }
-  return _phonemizeFn;
-}
-
-interface VoiceSessionCache {
-  session: any;
-  config: any;
-}
-
-const sessionCache = new Map<string, VoiceSessionCache>();
-
-const MODELS_DIR = path.join(process.cwd(), "models", "tts");
-
-async function ensureModelDownloaded(
-  voiceId: string,
-  modelKey: string
-): Promise<{ modelPath: string; configPath: string }> {
-  if (!fs.existsSync(MODELS_DIR)) {
-    fs.mkdirSync(MODELS_DIR, { recursive: true });
+function getOrSpawnWorker(): ChildProcess {
+  if (workerProc && workerProc.connected && !workerProc.killed) {
+    return workerProc;
   }
 
-  const modelPath = path.join(MODELS_DIR, `${voiceId}.onnx`);
-  const configPath = path.join(MODELS_DIR, `${voiceId}.onnx.json`);
+  const workerScript = path.join(process.cwd(), "src", "lib", "tts", "vendor", "tts-worker.cjs");
 
-  if (fs.existsSync(modelPath) && fs.existsSync(configPath)) {
-    return { modelPath, configPath };
-  }
-
-  const encodedKey = encodeURIComponent(modelKey);
-  const onnxUrl = `https://nghitts.app/api/model/${encodedKey}.onnx`;
-  const jsonUrl = `https://nghitts.app/api/model/${encodedKey}.onnx.json`;
-
-  if (!fs.existsSync(configPath)) {
-    const resConfig = await fetch(jsonUrl);
-    if (!resConfig.ok) {
-      throw new Error(`Không thể tải cấu hình mô hình từ ${jsonUrl} (HTTP ${resConfig.status})`);
-    }
-    const configBuffer = Buffer.from(await resConfig.arrayBuffer());
-    fs.writeFileSync(configPath, configBuffer);
-  }
-
-  if (!fs.existsSync(modelPath)) {
-    const resModel = await fetch(onnxUrl);
-    if (!resModel.ok) {
-      throw new Error(`Không thể tải mô hình ONNX từ ${onnxUrl} (HTTP ${resModel.status})`);
-    }
-    const modelBuffer = Buffer.from(await resModel.arrayBuffer());
-    fs.writeFileSync(modelPath, modelBuffer);
-  }
-
-  return { modelPath, configPath };
-}
-
-async function getOrLoadSession(voiceId: string, modelKey: string): Promise<VoiceSessionCache> {
-  const cached = sessionCache.get(voiceId);
-  if (cached) {
-    return cached;
-  }
-
-  const { modelPath, configPath } = await ensureModelDownloaded(voiceId, modelKey);
-
-  const modelBuffer = fs.readFileSync(modelPath);
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-
-  const ort = getOrt();
-  const session = await ort.InferenceSession.create(modelBuffer, {
-    executionProviders: [{ name: "wasm", simd: true }],
+  const child = fork(workerScript, [], {
+    cwd: process.cwd(),
+    execArgv: ["--max-old-space-size=512"],
+    stdio: ["ignore", "inherit", "inherit", "ipc"],
   });
 
-  const entry: VoiceSessionCache = { session, config };
-  sessionCache.set(voiceId, entry);
-  return entry;
+  child.on("message", (msg: any) => {
+    if (!msg || typeof msg.id !== "number") return;
+    const pending = pendingRequests.get(msg.id);
+    if (!pending) return;
+    pendingRequests.delete(msg.id);
+    if (msg.ok && typeof msg.data === "string") {
+      pending.resolve(Buffer.from(msg.data, "base64"));
+    } else {
+      pending.reject(new Error(msg.error || "TTS worker synthesis failed"));
+    }
+  });
+
+  const cleanup = () => {
+    if (workerProc === child) {
+      workerProc = null;
+    }
+    for (const [id, pending] of pendingRequests.entries()) {
+      pendingRequests.delete(id);
+      pending.reject(new Error("TTS worker process exited unexpectedly"));
+    }
+  };
+
+  child.on("exit", cleanup);
+  child.on("error", cleanup);
+
+  workerProc = child;
+  return child;
 }
 
 export async function synthesizeNeuralVoice(
@@ -131,96 +60,32 @@ export async function synthesizeNeuralVoice(
   const effectiveVoiceId = voice ? voice.id : voiceId;
   const effectiveModelKey = voice ? voice.modelKey : "Ban Mai";
 
-  const { session, config } = await getOrLoadSession(effectiveVoiceId, effectiveModelKey);
+  const worker = getOrSpawnWorker();
+  const id = ++reqSeq;
 
-  const ort = getOrt();
-  const phonemize = getPhonemize();
+  return new Promise<Buffer>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error("TTS synthesis timed out after 30s"));
+    }, 30000);
 
-  // Normalize Unicode NFC and ensure sentence punctuation if missing
-  let inputText = text.trim();
-  const lastChar = inputText.slice(-1);
-  if (lastChar !== "." && lastChar !== "!" && lastChar !== "?" && lastChar !== "…") {
-    inputText += ".";
-  }
+    pendingRequests.set(id, {
+      resolve: (buf) => {
+        clearTimeout(timer);
+        resolve(buf);
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
 
-  const rawPhonemes: string[] = await phonemize(inputText, "vi");
-  const idMap = config.phoneme_id_map || {};
-
-  const bosId = Array.isArray(idMap["^"]) ? idMap["^"][0] : 1;
-  const padId = Array.isArray(idMap["_"]) ? idMap["_"][0] : 0;
-  const eosId = Array.isArray(idMap["$"]) ? idMap["$"][0] : 2;
-
-  const phonemeIds: number[] = [bosId, padId];
-
-  for (const part of rawPhonemes) {
-    const normalizedPart = part.normalize("NFD");
-    for (let i = 0; i < normalizedPart.length; i++) {
-      const ch = normalizedPart[i];
-      if (ch in idMap) {
-        const mapped = idMap[ch];
-        const val = Array.isArray(mapped) ? mapped[0] : mapped;
-        phonemeIds.push(val);
-        phonemeIds.push(padId);
-      }
-    }
-  }
-
-  phonemeIds.push(eosId);
-
-  // Speaking rate in Piper is inversely proportional to lengthScale
-  const safeSpeed = Math.max(0.5, Math.min(2.0, speed));
-  const lengthScale = 1.0 / safeSpeed;
-  const noiseScale = config.inference?.noise_scale || 0.667;
-  const noiseW = config.inference?.noise_w || 0.8;
-
-  const inputs: Record<string, any> = {
-    input: new ort.Tensor("int64", new BigInt64Array(phonemeIds.map((x) => BigInt(x))), [
-      1,
-      phonemeIds.length,
-    ]),
-    input_lengths: new ort.Tensor("int64", BigInt64Array.from([BigInt(phonemeIds.length)]), [1]),
-    scales: new ort.Tensor("float32", Float32Array.from([noiseScale, lengthScale, noiseW]), [3]),
-  };
-
-  if (config.num_speakers > 1) {
-    inputs["sid"] = new ort.Tensor("int64", BigInt64Array.from([BigInt(0)]), [1]);
-  }
-
-  const results = await session.run(inputs);
-  const rawData: Float32Array = results.output.data;
-  const audioData = new Float32Array(rawData);
-
-  // Anti-crack envelope: smooth linear decay over last 250 samples to prevent popping/breaking sound
-  const fadeCount = Math.min(250, audioData.length);
-  for (let i = 0; i < fadeCount; i++) {
-    const factor = (fadeCount - i) / fadeCount;
-    audioData[audioData.length - fadeCount + i] *= factor;
-  }
-
-  // Trailing silence padding (~160ms) for natural room ambience and smooth DAC playback
-  const sampleRate = config.audio?.sample_rate || 22050;
-  const silenceSamples = Math.floor(sampleRate * 0.16);
-  const totalSamples = audioData.length + silenceSamples;
-
-  const wavBuf = Buffer.alloc(44 + totalSamples * 2);
-  wavBuf.write("RIFF", 0);
-  wavBuf.writeUInt32LE(36 + totalSamples * 2, 4);
-  wavBuf.write("WAVE", 8);
-  wavBuf.write("fmt ", 12);
-  wavBuf.writeUInt32LE(16, 16);
-  wavBuf.writeUInt16LE(1, 20); // PCM format
-  wavBuf.writeUInt16LE(1, 22); // Mono channel
-  wavBuf.writeUInt32LE(sampleRate, 24);
-  wavBuf.writeUInt32LE(sampleRate * 2, 28);
-  wavBuf.writeUInt16LE(2, 32);
-  wavBuf.writeUInt16LE(16, 34);
-  wavBuf.write("data", 36);
-  wavBuf.writeUInt32LE(totalSamples * 2, 40);
-
-  for (let i = 0; i < audioData.length; i++) {
-    const s = Math.max(-1, Math.min(1, audioData[i]));
-    wavBuf.writeInt16LE(s < 0 ? s * 0x8000 : s * 0x7fff, 44 + i * 2);
-  }
-
-  return wavBuf;
+    worker.send({
+      id,
+      text,
+      voiceId: effectiveVoiceId,
+      modelKey: effectiveModelKey,
+      speed,
+    });
+  });
 }
