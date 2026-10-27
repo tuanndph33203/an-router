@@ -5,14 +5,13 @@ import { Card, Button, Badge } from "@/shared/components";
 
 interface VoiceItem {
   id: string;
-  modelKey: string;
   name: string;
   gender: "Nam" | "Nữ";
-  region: "Miền Bắc" | "Miền Trung" | "Miền Nam" | "Toàn quốc" | "Quốc tế";
+  region: "Toàn quốc";
   description: string;
   sampleText: string;
   demoAudioUrl: string;
-  engine: "google" | "nghitts";
+  engine: "google";
 }
 
 const PRESETS = {
@@ -27,12 +26,9 @@ const PRESETS = {
 export default function TtsStudioPage() {
   const [voices, setVoices] = useState<VoiceItem[]>([]);
   const [selectedVoiceId, setSelectedVoiceId] = useState<string>("google_vi");
-  const [activeEngine, setActiveEngine] = useState<"google" | "nghitts">("google");
   const [text, setText] = useState<string>(PRESETS.report);
   const [normalizedPreview, setNormalizedPreview] = useState<string>("");
   const [speed, setSpeed] = useState<number>(1.0);
-  const [filterRegion, setFilterRegion] = useState<string>("");
-  const [filterGender, setFilterGender] = useState<string>("");
   const [synthesizing, setSynthesizing] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [activeCodeTab, setActiveCodeTab] = useState<"curl" | "js" | "python" | "csharp">("curl");
@@ -64,7 +60,6 @@ export default function TtsStudioPage() {
         });
         if (res.ok) {
           const data = await res.json();
-
           setNormalizedPreview(data.normalizedText || "");
         }
       } catch {}
@@ -93,7 +88,7 @@ export default function TtsStudioPage() {
   async function handleSynthesize() {
     if (!text.trim()) return;
     setSynthesizing(true);
-    setStatusMessage("Đang chuẩn hóa tiếng Việt và tạo giọng nói...");
+    setStatusMessage("Đang tạo giọng nói...");
 
     try {
       const t0 = performance.now();
@@ -103,7 +98,6 @@ export default function TtsStudioPage() {
         body: JSON.stringify({
           text,
           voiceId: selectedVoiceId,
-          engine: activeEngine,
           speed,
           normalize: true,
         }),
@@ -128,9 +122,8 @@ export default function TtsStudioPage() {
       }
 
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-      const source = res.headers.get("X-Tts-Source") || activeEngine;
       setStatusMessage(
-        `✓ Đã tạo xong trong ${elapsed}s • Nguồn: ${source} • Dung lượng: ${(blob.size / 1024).toFixed(1)} KB`
+        `✓ Đã tạo xong trong ${elapsed}s • Dung lượng: ${(blob.size / 1024).toFixed(1)} KB`
       );
     } catch (err: any) {
       setStatusMessage(`❌ Lỗi: ${err.message}`);
@@ -141,10 +134,7 @@ export default function TtsStudioPage() {
 
   function playSelectedVoiceDemo() {
     if (mainAudioRef.current) {
-      const isGoogle = selectedVoiceId.startsWith("google");
-      mainAudioRef.current.src = isGoogle
-        ? `/api/tts/demos/${selectedVoiceId}`
-        : `/tts/demos/${selectedVoiceId}_demo.wav`;
+      mainAudioRef.current.src = `/api/tts/demos/${selectedVoiceId}`;
       mainAudioRef.current.playbackRate = speed;
       mainAudioRef.current.play().catch(() => {});
       setStatusMessage(
@@ -155,7 +145,6 @@ export default function TtsStudioPage() {
 
   function handleSelectVoice(v: VoiceItem) {
     setSelectedVoiceId(v.id);
-    setActiveEngine(v.engine);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -166,36 +155,17 @@ export default function TtsStudioPage() {
   }
 
   const selectedVoice = voices.find((v) => v.id === selectedVoiceId) || voices[0];
-  const filteredVoices = voices.filter(
-    (v) =>
-      (!filterRegion || v.region === filterRegion) && (!filterGender || v.gender === filterGender)
-  );
-
   const cleanTextForCode = (text || "Xin chào").split('"').join('\\"');
 
-  // Dynamic code snippets reflecting the selected engine, voice, and speed
-  const curlSnippet =
-    activeEngine === "google"
-      ? `curl -X POST "http://localhost:20128/api/tts/synthesize" \\
+  const curlSnippet = `curl -X POST "http://localhost:20128/api/tts/synthesize" \\
   -H "Content-Type: application/json" \\
   -d '{
     "text": "${cleanTextForCode}",
     "voiceId": "${selectedVoiceId}",
-    "engine": "google",
     "speed": ${speed},
     "normalize": true
   }' \\
-  --output speech_google.mp3`
-      : `curl -X POST "http://localhost:20128/api/tts/synthesize" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "text": "${cleanTextForCode}",
-    "voiceId": "${selectedVoiceId}",
-    "engine": "nghitts",
-    "speed": ${speed},
-    "normalize": true
-  }' \\
-  --output speech_nghitts.wav`;
+  --output speech.mp3`;
 
   const jsSnippet = `const res = await fetch("http://localhost:20128/api/tts/synthesize", {
   method: "POST",
@@ -203,7 +173,6 @@ export default function TtsStudioPage() {
   body: JSON.stringify({
     text: "${cleanTextForCode}",
     voiceId: "${selectedVoiceId}",
-    engine: "${activeEngine}",
     speed: ${speed},
     normalize: true
   })
@@ -220,27 +189,25 @@ res = requests.post(
     json={
         "text": "${cleanTextForCode}",
         "voiceId": "${selectedVoiceId}",
-        "engine": "${activeEngine}",
         "speed": ${speed},
         "normalize": True
     }
 )
 
-with open("speech.${activeEngine === "google" ? "mp3" : "wav"}", "wb") as f:
+with open("speech.mp3", "wb") as f:
     f.write(res.content)`;
 
   const csharpSnippet = `using var client = new HttpClient();
 var payload = new {
     text = "${cleanTextForCode}",
     voiceId = "${selectedVoiceId}",
-    engine = "${activeEngine}",
     speed = ${speed}f,
     normalize = true
 };
 
 var response = await client.PostAsJsonAsync("http://localhost:20128/api/tts/synthesize", payload);
 byte[] audioBytes = await response.Content.ReadAsByteArrayAsync();
-await File.WriteAllBytesAsync("speech.${activeEngine === "google" ? "mp3" : "wav"}", audioBytes);`;
+await File.WriteAllBytesAsync("speech.mp3", audioBytes);`;
 
   const currentSnippet =
     activeCodeTab === "curl"
@@ -266,11 +233,10 @@ await File.WriteAllBytesAsync("speech.${activeEngine === "google" ? "mp3" : "wav
             <h1 className="text-2xl font-bold tracking-tight text-foreground flex items-center gap-2">
               <span className="text-2xl">🎙️</span> Studio Giọng Nói AI
             </h1>
-            <Badge variant="secondary">19 Giọng Tiếng Việt</Badge>
+            <Badge variant="secondary">Google Voice</Badge>
           </div>
           <p className="text-sm text-muted-foreground mt-1">
-            Chuyển đổi văn bản thành giọng nói tiếng Việt tự nhiên với 19 giọng đọc vùng miền và
-            Google • Tùy chỉnh tốc độ đọc
+            Chuyển đổi văn bản thành giọng nói tiếng Việt tự nhiên • Tùy chỉnh tốc độ đọc
           </p>
         </div>
 
@@ -336,15 +302,12 @@ await File.WriteAllBytesAsync("speech.${activeEngine === "google" ? "mp3" : "wav
             <div className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-                  Chọn Giọng Đọc ({voices.length || 19} Giọng)
+                  Chọn Giọng Đọc
                 </label>
                 <select
                   value={selectedVoiceId}
                   onChange={(e) => {
-                    const vId = e.target.value;
-                    setSelectedVoiceId(vId);
-                    const found = voices.find((x) => x.id === vId);
-                    if (found) setActiveEngine(found.engine);
+                    setSelectedVoiceId(e.target.value);
                   }}
                   className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
                 >
@@ -427,39 +390,15 @@ await File.WriteAllBytesAsync("speech.${activeEngine === "google" ? "mp3" : "wav
 
       {/* Voice Gallery */}
       <div className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-bold text-foreground">Danh Sách Giọng Mẫu</h2>
-            <p className="text-xs text-muted-foreground">
-              Nghe thử tức thì 19 giọng đọc tiếng Việt đặc trưng vùng miền và Google
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <select
-              value={filterRegion}
-              onChange={(e) => setFilterRegion(e.target.value)}
-              className="rounded-lg border border-input bg-background px-2.5 py-1.5 text-xs text-foreground"
-            >
-              <option value="">Tất cả vùng miền</option>
-              <option value="Toàn quốc">Toàn quốc</option>
-              <option value="Miền Bắc">Miền Bắc</option>
-              <option value="Miền Nam">Miền Nam</option>
-              <option value="Miền Trung">Miền Trung</option>
-            </select>
-            <select
-              value={filterGender}
-              onChange={(e) => setFilterGender(e.target.value)}
-              className="rounded-lg border border-input bg-background px-2.5 py-1.5 text-xs text-foreground"
-            >
-              <option value="">Tất cả giới tính</option>
-              <option value="Nữ">Giọng Nữ</option>
-              <option value="Nam">Giọng Nam</option>
-            </select>
-          </div>
+        <div>
+          <h2 className="text-lg font-bold text-foreground">Danh Sách Giọng Mẫu</h2>
+          <p className="text-xs text-muted-foreground">
+            Nghe thử giọng đọc tiếng Việt được kết nối trực tiếp
+          </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredVoices.map((v) => (
+          {voices.map((v) => (
             <Card
               key={v.id}
               className={`p-4 border flex flex-col justify-between gap-3 transition ${
@@ -510,8 +449,8 @@ await File.WriteAllBytesAsync("speech.${activeEngine === "google" ? "mp3" : "wav
             </h2>
             <p className="text-xs text-muted-foreground mt-0.5">
               Hỗ trợ tùy chọn tham số{" "}
-              <code className="text-primary font-mono">{`"engine": "${activeEngine}"`}</code> và{" "}
-              <code className="text-primary font-mono">{`"speed": ${speed}`}</code>
+              <code className="text-primary font-mono">{`"speed": ${speed}`}</code> và{" "}
+              <code className="text-primary font-mono">{`"normalize": true`}</code>
             </p>
           </div>
           <Button variant="secondary" size="sm" onClick={copyCode} className="text-xs">
