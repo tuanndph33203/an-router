@@ -35,9 +35,9 @@ export async function synthesizeSpeech(
   const isGoogleMode =
     options.engine === "google" || voiceId.startsWith("google") || voice?.engine === "google";
 
-  // ── Strategy 1: Google TTS Forward (Lightning fast ~150ms-300ms) ──
+  // ── Strategy 1: Google TTS Forward (~150ms-300ms) ──
   if (isGoogleMode) {
-    const lang = options.lang || (voiceId === "google_en" ? "en" : "vi");
+    const lang = options.lang || "vi";
     try {
       const mp3Buffer = await synthesizeGtts({
         text: normalizedText,

@@ -6,7 +6,7 @@ export interface VoiceInfo {
   modelKey: string;
   name: string;
   gender: "Nam" | "Nữ";
-  region: "Miền Bắc" | "Miền Trung" | "Miền Nam" | "Toàn quốc" | "Quốc tế";
+  region: "Miền Bắc" | "Miền Trung" | "Miền Nam" | "Toàn quốc";
   description: string;
   sampleText: string;
   demoAudioUrl: string;
@@ -14,23 +14,14 @@ export interface VoiceInfo {
 }
 
 const RAW_VOICES: Omit<VoiceInfo, "sampleText" | "demoAudioUrl">[] = [
-  // ── Google Voice Stream (Fast Forward) ─────────────────────────
+  // ── Google Voice Stream ─────────────────────────────────────────
   {
     id: "google_vi",
     modelKey: "Google Tiếng Việt",
-    name: "Google Tiếng Việt (Siêu tốc)",
+    name: "Google Tiếng Việt",
     gender: "Nữ",
     region: "Toàn quốc",
-    description: "Giọng đọc Google chuẩn xác, phản hồi tức thì (~200ms) qua luồng Google Forward",
-    engine: "google",
-  },
-  {
-    id: "google_en",
-    modelKey: "Google English",
-    name: "Google English (Fast)",
-    gender: "Nữ",
-    region: "Quốc tế",
-    description: "Giọng tiếng Anh chuẩn quốc tế qua luồng Google Forward",
+    description: "Giọng đọc Google tự nhiên, phản hồi tức thì",
     engine: "google",
   },
   // ── 18 Giọng NGHI-TTS (VITS Local Neural Engine) ────────────────
