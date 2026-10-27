@@ -2,11 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { findVoiceByIdOrName } from "./voiceCatalog.ts";
 import { vietnameseNormalizer } from "./vietnameseNormalizer.ts";
+import { synthesizeGtts } from "../../../open-sse/executors/gtts.ts";
 
 export interface TtsSynthesizeOptions {
   text: string;
   voiceId?: string;
+  engine?: "google" | "nghitts" | "auto";
   speed?: number;
+  lang?: string;
   normalize?: boolean;
 }
 
@@ -15,21 +18,45 @@ export interface TtsSynthesizeResult {
   contentType: string;
   normalizedText: string;
   voiceId: string;
-  source: "local-engine" | "demo-fallback";
+  source: "google-forward" | "local-engine" | "demo-fallback";
 }
 
 export async function synthesizeSpeech(
   options: TtsSynthesizeOptions
 ): Promise<TtsSynthesizeResult> {
   const voice = findVoiceByIdOrName(options.voiceId);
-  const voiceId = voice ? voice.id : "ban_mai";
+  const voiceId = voice ? voice.id : options.voiceId || "ban_mai";
   const speed = options.speed && options.speed > 0 ? options.speed : 1.0;
   const shouldNormalize = options.normalize !== false;
 
   const rawText = options.text?.trim() || "Xin chào";
   const normalizedText = shouldNormalize ? vietnameseNormalizer.normalize(rawText) : rawText;
 
-  // Strategy 1: Call high-speed C# .NET 10 In-Process ONNX Engine on port 5000 if active
+  const isGoogleMode =
+    options.engine === "google" || voiceId.startsWith("google") || voice?.engine === "google";
+
+  // ── Strategy 1: Google TTS Forward (Lightning fast ~150ms-300ms) ──
+  if (isGoogleMode) {
+    const lang = options.lang || (voiceId === "google_en" ? "en" : "vi");
+    try {
+      const mp3Buffer = await synthesizeGtts({
+        text: normalizedText,
+        lang,
+      });
+
+      return {
+        audioBuffer: mp3Buffer,
+        contentType: "audio/mpeg",
+        normalizedText,
+        voiceId,
+        source: "google-forward",
+      };
+    } catch (err: any) {
+      console.warn("[TTS] Google forward failed, trying fallback:", err?.message);
+    }
+  }
+
+  // ── Strategy 2: High-speed C# .NET 10 In-Process ONNX Engine (18 Vietnamese Voices) ──
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12000);
@@ -62,7 +89,7 @@ export async function synthesizeSpeech(
     // Port 5000 engine not reachable, proceed to local demo sample fallback
   }
 
-  // Strategy 2: Pre-recorded WAV demo sample
+  // ── Strategy 3: Pre-recorded WAV demo sample fallback ──
   const demoPath = path.join(process.cwd(), "public", "tts", "demos", `${voiceId}_demo.wav`);
   if (fs.existsSync(demoPath)) {
     const buffer = fs.readFileSync(demoPath);

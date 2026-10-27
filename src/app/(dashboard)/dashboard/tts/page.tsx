@@ -8,10 +8,11 @@ interface VoiceItem {
   modelKey: string;
   name: string;
   gender: "Nam" | "Nữ";
-  region: "Miền Bắc" | "Miền Trung" | "Miền Nam";
+  region: "Miền Bắc" | "Miền Trung" | "Miền Nam" | "Toàn quốc" | "Quốc tế";
   description: string;
   sampleText: string;
   demoAudioUrl: string;
+  engine: "google" | "nghitts";
 }
 
 const PRESETS = {
@@ -25,7 +26,8 @@ const PRESETS = {
 
 export default function TtsStudioPage() {
   const [voices, setVoices] = useState<VoiceItem[]>([]);
-  const [selectedVoiceId, setSelectedVoiceId] = useState<string>("ban_mai");
+  const [selectedVoiceId, setSelectedVoiceId] = useState<string>("google_vi");
+  const [activeEngine, setActiveEngine] = useState<"google" | "nghitts">("google");
   const [text, setText] = useState<string>(PRESETS.report);
   const [normalizedPreview, setNormalizedPreview] = useState<string>("");
   const [speed, setSpeed] = useState<number>(1.0);
@@ -91,7 +93,11 @@ export default function TtsStudioPage() {
   async function handleSynthesize() {
     if (!text.trim()) return;
     setSynthesizing(true);
-    setStatusMessage("Đang chuẩn hóa tiếng Việt và tạo sóng âm 22.050Hz...");
+    setStatusMessage(
+      activeEngine === "google"
+        ? "Đang chuyển tiếp luồng Google TTS (siêu tốc ~150ms)..."
+        : "Đang chuẩn hóa tiếng Việt và tạo sóng âm 22.050Hz qua mô hình VITS..."
+    );
 
     try {
       const t0 = performance.now();
@@ -101,6 +107,7 @@ export default function TtsStudioPage() {
         body: JSON.stringify({
           text,
           voiceId: selectedVoiceId,
+          engine: activeEngine,
           speed,
           normalize: true,
         }),
@@ -120,12 +127,14 @@ export default function TtsStudioPage() {
       const url = URL.createObjectURL(blob);
       if (mainAudioRef.current) {
         mainAudioRef.current.src = url;
+        mainAudioRef.current.playbackRate = speed;
         mainAudioRef.current.play().catch(() => {});
       }
 
       const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+      const source = res.headers.get("X-Tts-Source") || activeEngine;
       setStatusMessage(
-        `✓ Đã tạo xong trong ${elapsed}s • Kích thước: ${(blob.size / 1024).toFixed(1)} KB`
+        `✓ Đã tạo xong trong ${elapsed}s • Nguồn: ${source} • Dung lượng: ${(blob.size / 1024).toFixed(1)} KB`
       );
     } catch (err: any) {
       setStatusMessage(`❌ Lỗi: ${err.message}`);
@@ -136,17 +145,31 @@ export default function TtsStudioPage() {
 
   function playSelectedVoiceDemo() {
     if (mainAudioRef.current) {
-      mainAudioRef.current.src = `/tts/demos/${selectedVoiceId}_demo.wav`;
+      const isGoogle = selectedVoiceId.startsWith("google");
+      mainAudioRef.current.src = isGoogle
+        ? `/api/tts/demos/${selectedVoiceId}`
+        : `/tts/demos/${selectedVoiceId}_demo.wav`;
+      mainAudioRef.current.playbackRate = speed;
       mainAudioRef.current.play().catch(() => {});
       setStatusMessage(
-        `Đang phát mẫu âm thanh có sẵn của giọng: ${selectedVoice?.name || selectedVoiceId}`
+        `Đang phát mẫu âm thanh của giọng: ${selectedVoice?.name || selectedVoiceId} (${speed}x)`
       );
     }
   }
 
-  function handleSelectVoice(vId: string) {
-    setSelectedVoiceId(vId);
+  function handleSelectVoice(v: VoiceItem) {
+    setSelectedVoiceId(v.id);
+    setActiveEngine(v.engine);
     window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function handleEngineSwitch(engine: "google" | "nghitts") {
+    setActiveEngine(engine);
+    if (engine === "google") {
+      setSelectedVoiceId("google_vi");
+    } else if (selectedVoiceId.startsWith("google")) {
+      setSelectedVoiceId("ban_mai");
+    }
   }
 
   function handlePresetClick(key: keyof typeof PRESETS) {
@@ -163,15 +186,29 @@ export default function TtsStudioPage() {
 
   const cleanTextForCode = (text || "Xin chào").split('"').join('\\"');
 
-  const curlSnippet = `curl -X POST "http://localhost:20128/api/tts/synthesize" \\
+  // Dynamic code snippets reflecting the selected engine, voice, and speed
+  const curlSnippet =
+    activeEngine === "google"
+      ? `curl -X POST "http://localhost:20128/api/tts/synthesize" \\
   -H "Content-Type: application/json" \\
   -d '{
     "text": "${cleanTextForCode}",
     "voiceId": "${selectedVoiceId}",
+    "engine": "google",
     "speed": ${speed},
     "normalize": true
   }' \\
-  --output speech.wav`;
+  --output speech_google.mp3`
+      : `curl -X POST "http://localhost:20128/api/tts/synthesize" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "text": "${cleanTextForCode}",
+    "voiceId": "${selectedVoiceId}",
+    "engine": "nghitts",
+    "speed": ${speed},
+    "normalize": true
+  }' \\
+  --output speech_nghitts.wav`;
 
   const jsSnippet = `const res = await fetch("http://localhost:20128/api/tts/synthesize", {
   method: "POST",
@@ -179,12 +216,14 @@ export default function TtsStudioPage() {
   body: JSON.stringify({
     text: "${cleanTextForCode}",
     voiceId: "${selectedVoiceId}",
+    engine: "${activeEngine}",
     speed: ${speed},
     normalize: true
   })
 });
 const audioBlob = await res.blob();
 const audio = new Audio(URL.createObjectURL(audioBlob));
+audio.playbackRate = ${speed};
 audio.play();`;
 
   const pythonSnippet = `import requests
@@ -194,25 +233,27 @@ res = requests.post(
     json={
         "text": "${cleanTextForCode}",
         "voiceId": "${selectedVoiceId}",
+        "engine": "${activeEngine}",
         "speed": ${speed},
         "normalize": True
     }
 )
 
-with open("speech.wav", "wb") as f:
+with open("speech.${activeEngine === "google" ? "mp3" : "wav"}", "wb") as f:
     f.write(res.content)`;
 
   const csharpSnippet = `using var client = new HttpClient();
 var payload = new {
     text = "${cleanTextForCode}",
     voiceId = "${selectedVoiceId}",
+    engine = "${activeEngine}",
     speed = ${speed}f,
     normalize = true
 };
 
 var response = await client.PostAsJsonAsync("http://localhost:20128/api/tts/synthesize", payload);
-byte[] wavBytes = await response.Content.ReadAsByteArrayAsync();
-await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
+byte[] audioBytes = await response.Content.ReadAsByteArrayAsync();
+await File.WriteAllBytesAsync("speech.${activeEngine === "google" ? "mp3" : "wav"}", audioBytes);`;
 
   const currentSnippet =
     activeCodeTab === "curl"
@@ -236,13 +277,13 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
         <div>
           <div className="flex items-center gap-2.5">
             <h1 className="text-2xl font-bold tracking-tight text-foreground flex items-center gap-2">
-              <span className="text-2xl">🎙️</span> Studio Giọng Nói AI Tiếng Việt
+              <span className="text-2xl">🎙️</span> Studio Giọng Nói AI (Google Forward & NGHI-TTS)
             </h1>
-            <Badge variant="success">NGHI-TTS 100% Native</Badge>
+            <Badge variant="success">Dual-Engine (Google + VITS)</Badge>
           </div>
           <p className="text-sm text-muted-foreground mt-1">
-            Chuyển đổi văn bản thành giọng nói tiếng Việt tự nhiên • 18 Giọng Bắc - Trung - Nam •
-            Chuẩn hóa số & tiền tệ tự động
+            Chuyển đổi văn bản thành giọng nói tiếng Việt tự nhiên • Tùy chọn Luồng Google Siêu Tốc
+            (~150ms) hoặc 18 Giọng NGHI-TTS • Tùy chỉnh tốc độ đọc
           </p>
         </div>
 
@@ -261,6 +302,37 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
 
       {/* Main Studio Card */}
       <Card className="p-6 border border-border shadow-sm">
+        {/* Engine Switcher Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-3 p-3 mb-6 rounded-xl bg-muted/60 border border-border">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            <span>⚙️ Chọn Luồng Xử Lý (Engine):</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleEngineSwitch("google")}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                activeEngine === "google"
+                  ? "bg-emerald-600 text-white shadow-sm"
+                  : "bg-background text-muted-foreground hover:text-foreground border border-border"
+              }`}
+            >
+              <span>⚡</span> Luồng Google TTS (Siêu tốc ~150ms)
+            </button>
+            <button
+              type="button"
+              onClick={() => handleEngineSwitch("nghitts")}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                activeEngine === "nghitts"
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "bg-background text-muted-foreground hover:text-foreground border border-border"
+              }`}
+            >
+              <span>🎭</span> Luồng NGHI-TTS (18 Giọng truyền cảm)
+            </button>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Left 2 Cols: Text Input & Normalization */}
           <div className="lg:col-span-2 space-y-4">
@@ -308,18 +380,36 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
             <div className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-                  Chọn Giọng Đọc ({voices.length || 18} Giọng)
+                  Chọn Giọng Đọc ({voices.length || 20} Giọng)
                 </label>
                 <select
                   value={selectedVoiceId}
-                  onChange={(e) => setSelectedVoiceId(e.target.value)}
+                  onChange={(e) => {
+                    const vId = e.target.value;
+                    setSelectedVoiceId(vId);
+                    const found = voices.find((x) => x.id === vId);
+                    if (found) setActiveEngine(found.engine);
+                  }}
                   className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
                 >
-                  {voices.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {v.name} ({v.gender} - {v.region})
-                    </option>
-                  ))}
+                  <optgroup label="⚡ Luồng Google TTS (Forward)">
+                    {voices
+                      .filter((v) => v.engine === "google")
+                      .map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.name}
+                        </option>
+                      ))}
+                  </optgroup>
+                  <optgroup label="🎭 Luồng NGHI-TTS (18 Giọng truyền cảm)">
+                    {voices
+                      .filter((v) => v.engine === "nghitts")
+                      .map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.name} ({v.gender} - {v.region})
+                        </option>
+                      ))}
+                  </optgroup>
                 </select>
                 {selectedVoice && (
                   <p className="text-xs text-muted-foreground mt-1.5">
@@ -337,13 +427,25 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
                 </div>
                 <input
                   type="range"
-                  min="0.6"
-                  max="1.6"
+                  min="0.5"
+                  max="2.0"
                   step="0.05"
                   value={speed}
-                  onChange={(e) => setSpeed(parseFloat(e.target.value))}
+                  onChange={(e) => {
+                    const newSpeed = parseFloat(e.target.value);
+                    setSpeed(newSpeed);
+                    if (mainAudioRef.current) {
+                      mainAudioRef.current.playbackRate = newSpeed;
+                    }
+                  }}
                   className="w-full accent-primary cursor-pointer"
                 />
+                <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
+                  <span>0.5x (Chậm)</span>
+                  <span>1.0x (Chuẩn)</span>
+                  <span>1.5x (Nhanh)</span>
+                  <span>2.0x</span>
+                </div>
               </div>
             </div>
 
@@ -362,9 +464,17 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
                   size="sm"
                   onClick={handleSynthesize}
                   disabled={synthesizing || !text.trim()}
-                  className="w-full text-xs font-semibold"
+                  className={`w-full text-xs font-semibold ${
+                    activeEngine === "google"
+                      ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                      : ""
+                  }`}
                 >
-                  {synthesizing ? "Đang xử lý..." : "⚡ Tạo Giọng Đọc"}
+                  {synthesizing
+                    ? "Đang xử lý..."
+                    : activeEngine === "google"
+                      ? "⚡ Google Phát Ngay"
+                      : "⚡ Tạo Giọng Đọc"}
                 </Button>
               </div>
 
@@ -380,15 +490,15 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
         </div>
       </Card>
 
-      {/* 18 Voice Gallery */}
+      {/* Voice Gallery */}
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-lg font-bold text-foreground">
-              Thư Viện 18 Giọng Đọc Mẫu Tiếng Việt
+              Danh Sách Giọng Mẫu (Google & NGHI-TTS)
             </h2>
             <p className="text-xs text-muted-foreground">
-              Nghe thử tức thì 18 file âm thanh mẫu chất lượng cao 22.050Hz
+              Nghe thử tức thì mẫu giọng Google Forward và 18 giọng đọc đặc trưng vùng miền
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -398,6 +508,7 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
               className="rounded-lg border border-input bg-background px-2.5 py-1.5 text-xs text-foreground"
             >
               <option value="">Tất cả vùng miền</option>
+              <option value="Toàn quốc">Google (Toàn quốc)</option>
               <option value="Miền Bắc">Miền Bắc</option>
               <option value="Miền Nam">Miền Nam</option>
               <option value="Miền Trung">Miền Trung</option>
@@ -418,14 +529,25 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
           {filteredVoices.map((v) => (
             <Card
               key={v.id}
-              className="p-4 border border-border flex flex-col justify-between gap-3"
+              className={`p-4 border flex flex-col justify-between gap-3 transition ${
+                v.engine === "google" ? "border-emerald-500/50 bg-emerald-500/5" : "border-border"
+              }`}
             >
               <div>
                 <div className="flex items-center justify-between gap-2">
-                  <h3 className="font-bold text-foreground text-sm">{v.name}</h3>
+                  <h3 className="font-bold text-foreground text-sm flex items-center gap-1.5">
+                    {v.engine === "google" && <span className="text-xs">⚡</span>}
+                    {v.name}
+                  </h3>
                   <div className="flex items-center gap-1.5">
-                    <Badge variant={v.gender === "Nữ" ? "error" : "primary"}>{v.gender}</Badge>
-                    <Badge variant="secondary">{v.region}</Badge>
+                    {v.engine === "google" ? (
+                      <Badge variant="success">Google ~150ms</Badge>
+                    ) : (
+                      <>
+                        <Badge variant={v.gender === "Nữ" ? "error" : "primary"}>{v.gender}</Badge>
+                        <Badge variant="secondary">{v.region}</Badge>
+                      </>
+                    )}
                   </div>
                 </div>
                 <p className="text-xs text-muted-foreground mt-1">{v.description}</p>
@@ -439,9 +561,9 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
                 <div className="flex items-center justify-between">
                   <code className="text-[11px] text-primary">{`id: "${v.id}"`}</code>
                   <Button
-                    variant="secondary"
+                    variant={v.engine === "google" ? "primary" : "secondary"}
                     size="sm"
-                    onClick={() => handleSelectVoice(v.id)}
+                    onClick={() => handleSelectVoice(v)}
                     className="text-xs"
                   >
                     Chọn giọng này ↑
@@ -458,10 +580,12 @@ await File.WriteAllBytesAsync("speech.wav", wavBytes);`;
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-bold text-foreground flex items-center gap-2">
-              <span>🔌</span> Tài Liệu Kết Nối API Giọng Nói (OmniRoute API)
+              <span>🔌</span> Tài Liệu Kết Nối API Giọng Nói (Google Forward & NGHI-TTS)
             </h2>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Tích hợp vào bất kỳ ứng dụng di động, web, hoặc bot AI qua HTTP REST tiêu chuẩn
+              Hỗ trợ tùy chọn tham số{" "}
+              <code className="text-primary font-mono">{`"engine": "${activeEngine}"`}</code> và{" "}
+              <code className="text-primary font-mono">{`"speed": ${speed}`}</code>
             </p>
           </div>
           <Button variant="secondary" size="sm" onClick={copyCode} className="text-xs">
