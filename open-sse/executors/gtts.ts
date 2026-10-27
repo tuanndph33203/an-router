@@ -57,6 +57,7 @@ export interface GttsSynthInput {
   text: string;
   lang?: string;
   tld?: string;
+  slow?: boolean;
 }
 
 /** Normalize a caller-supplied language code, falling back to English. */
@@ -94,8 +95,8 @@ export function chunkGttsText(text: unknown, maxChars: number = GOOGLE_TTS_MAX_C
 }
 
 /** Build the `f.req=`-prefixed, urlencoded RPC body for one text chunk. */
-export function buildGttsRpcBody(text: string, lang: string): string {
-  const innerPayload = JSON.stringify([text, lang, true, "null"]);
+export function buildGttsRpcBody(text: string, lang: string, slow = false): string {
+  const innerPayload = JSON.stringify([text, lang, slow ? true : null, "null"]);
   const envelope = [[[GTTS_RPC_ID, innerPayload, null, "generic"]]];
   return `f.req=${encodeURIComponent(JSON.stringify(envelope))}&`;
 }
@@ -164,9 +165,10 @@ async function synthesizeGttsChunk(
   chunk: string,
   lang: string,
   tld: string,
+  slow: boolean,
   fetchImpl: FetchLike
 ): Promise<Buffer> {
-  const body = buildGttsRpcBody(chunk, lang);
+  const body = buildGttsRpcBody(chunk, lang, slow);
   const res = await fetchImpl(
     `https://translate.google.${tld}/_/TranslateWebserverUi/data/batchexecute`,
     {
@@ -201,6 +203,7 @@ export async function synthesizeGtts(
 ): Promise<Buffer<ArrayBuffer>> {
   const lang = normalizeGttsLang(input.lang);
   const tld = (typeof input.tld === "string" && input.tld.trim()) || DEFAULT_TLD;
+  const slow = Boolean(input.slow);
   const chunks = chunkGttsText(input.text);
   if (chunks.length === 0) {
     throw new GttsUpstreamError(400, "gTTS requires non-empty input text");
@@ -208,7 +211,7 @@ export async function synthesizeGtts(
 
   const buffers: Buffer[] = [];
   for (const chunk of chunks) {
-    buffers.push(await synthesizeGttsChunk(chunk, lang, tld, fetchImpl));
+    buffers.push(await synthesizeGttsChunk(chunk, lang, tld, slow, fetchImpl));
   }
   return Buffer.concat(buffers);
 }

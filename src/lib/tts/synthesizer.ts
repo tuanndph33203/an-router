@@ -39,6 +39,7 @@ export async function synthesizeSpeech(
   // ── Strategy 1: Google TTS Forward (~150ms-300ms) ──
   if (isGoogleMode) {
     const lang = options.lang || "vi";
+    const slow = options.speed !== undefined && options.speed < 0.85;
     try {
       // Ensure sentence punctuation to avoid rising tone or clipped ending
       let googleInput = normalizedText.trim();
@@ -50,6 +51,7 @@ export async function synthesizeSpeech(
       const mp3Buffer = await synthesizeGtts({
         text: googleInput,
         lang,
+        slow,
       });
 
       return {
