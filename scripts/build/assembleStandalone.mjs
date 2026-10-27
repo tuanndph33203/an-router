@@ -423,6 +423,21 @@ export const EXTRA_MODULE_ENTRIES = [
   },
   { label: "public directory", src: ["public"], dest: ["public"] },
   {
+    label: "TTS vendored libraries",
+    src: ["src", "lib", "tts", "vendor"],
+    dest: ["src", "lib", "tts", "vendor"],
+  },
+  {
+    label: "TTS models directory",
+    src: ["models"],
+    dest: ["models"],
+  },
+  {
+    label: "onnxruntime-web",
+    src: ["node_modules", "onnxruntime-web"],
+    dest: ["node_modules", "onnxruntime-web"],
+  },
+  {
     label: "playwright-core (dynamic import by gemini-web executor)",
     src: ["node_modules", "playwright-core"],
     dest: ["node_modules", "playwright-core"],

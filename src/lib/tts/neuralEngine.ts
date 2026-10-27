@@ -3,10 +3,53 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { findVoiceByIdOrName } from "./voiceCatalog.ts";
 
-const runtimeRequire = createRequire(path.join(process.cwd(), "package.json"));
-const ORT_PATH =
-  "/home/nguyendinhtuan/Documents/antigravity/bold-noether/nghitts/node_modules/onnxruntime-web";
-const ort = runtimeRequire(ORT_PATH);
+const _require = createRequire(import.meta.url);
+
+let _ortInstance: any = null;
+function getOrt(): any {
+  if (!_ortInstance) {
+    _ortInstance = _require("onnxruntime-web");
+  }
+  return _ortInstance;
+}
+
+let _phonemizeFn: any = null;
+function getPhonemize(): (text: string, options?: any) => Promise<string> {
+  if (!_phonemizeFn) {
+    const candidatePaths = [
+      path.join(
+        process.cwd(),
+        "src",
+        "lib",
+        "tts",
+        "vendor",
+        "phonemizer",
+        "dist",
+        "phonemizer.cjs"
+      ),
+      path.join(process.cwd(), "vendor", "phonemizer", "dist", "phonemizer.cjs"),
+      path.resolve(
+        path.dirname(new URL(import.meta.url).pathname),
+        "vendor",
+        "phonemizer",
+        "dist",
+        "phonemizer.cjs"
+      ),
+    ];
+    let loaded: any = null;
+    for (const p of candidatePaths) {
+      if (fs.existsSync(p)) {
+        loaded = _require(p);
+        break;
+      }
+    }
+    if (!loaded) {
+      loaded = _require(candidatePaths[0]);
+    }
+    _phonemizeFn = loaded.phonemize || loaded;
+  }
+  return _phonemizeFn;
+}
 
 interface VoiceSessionCache {
   session: any;
@@ -68,6 +111,7 @@ async function getOrLoadSession(voiceId: string, modelKey: string): Promise<Voic
   const modelBuffer = fs.readFileSync(modelPath);
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
+  const ort = getOrt();
   const session = await ort.InferenceSession.create(modelBuffer, {
     executionProviders: [{ name: "wasm", simd: true }],
   });
@@ -88,18 +132,8 @@ export async function synthesizeNeuralVoice(
 
   const { session, config } = await getOrLoadSession(effectiveVoiceId, effectiveModelKey);
 
-  // Load eSpeak phonemizer (vendored CommonJS) via runtimeRequire
-  const phonemizerPath = path.join(
-    process.cwd(),
-    "src",
-    "lib",
-    "tts",
-    "vendor",
-    "phonemizer",
-    "dist",
-    "phonemizer.cjs"
-  );
-  const { phonemize } = runtimeRequire(phonemizerPath);
+  const ort = getOrt();
+  const phonemize = getPhonemize();
 
   // Normalize Unicode NFC and ensure sentence punctuation if missing
   let inputText = text.trim();

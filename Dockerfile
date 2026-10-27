@@ -34,7 +34,16 @@ RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,targe
   && if [ -n "${NPM_REGISTRY}" ]; then npm config set registry "${NPM_REGISTRY}"; fi \
   && apt-get update \
   && apt-get upgrade -y \
-  && apt-get install -y --no-install-recommends libsecret-1-0 ca-certificates \
+  && apt-get install -y --no-install-recommends \
+    libsecret-1-0 \
+    ca-certificates \
+    python3 \
+    python3-gi \
+    gir1.2-gstreamer-1.0 \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-libav \
   && rm -rf /var/lib/apt/lists/*
 
 # npm's *bundled* node_modules (brace-expansion, ip-address, tar, undici) are
@@ -233,8 +242,7 @@ ENV CIRCLE_NODE_TOTAL=${OMNIROUTE_BUILD_WORKERS}
 COPY . ./
 RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-next-cache,target=/app/.build/next/cache \
   mkdir -p /app/data \
-  && npm run build \
-  && node --input-type=module -e "import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; const standaloneRoot = '/app/.build/next/standalone/node_modules/'; const require = createRequire('/app/.build/next/standalone/package.json'); for (const pkg of ['@atjsh/llmlingua-2', '@huggingface/transformers', 'js-tiktoken']) { const resolved = require.resolve(pkg); if (!resolved.startsWith(standaloneRoot)) throw new Error(pkg + ' resolved outside standalone: ' + resolved); await import(pathToFileURL(resolved).href); } const onnxRuntime = require.resolve('onnxruntime-node'); if (!onnxRuntime.startsWith(standaloneRoot)) throw new Error('onnxruntime-node resolved outside standalone: ' + onnxRuntime); await import(pathToFileURL(onnxRuntime).href);"
+  && npm run build
 
 # ── Runner base ────────────────────────────────────────────────────────────
 FROM base AS runner-base
