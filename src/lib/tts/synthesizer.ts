@@ -4,6 +4,7 @@ import { findVoiceByIdOrName } from "./voiceCatalog.ts";
 import { vietnameseNormalizer } from "./vietnameseNormalizer.ts";
 import { synthesizeGtts } from "../../../open-sse/executors/gtts.ts";
 import { synthesizeNeuralVoice } from "./neuralEngine.ts";
+import { scaleMp3Speed } from "./audioSpeedScaler.ts";
 
 export interface TtsSynthesizeOptions {
   text: string;
@@ -54,8 +55,13 @@ export async function synthesizeSpeech(
         slow,
       });
 
+      let finalAudioBuffer = mp3Buffer;
+      if (speed && Math.abs(speed - 1.0) >= 0.05) {
+        finalAudioBuffer = await scaleMp3Speed(mp3Buffer, speed);
+      }
+
       return {
-        audioBuffer: mp3Buffer,
+        audioBuffer: finalAudioBuffer,
         contentType: "audio/mpeg",
         normalizedText,
         voiceId,
